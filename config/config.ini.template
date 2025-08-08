@@ -1,0 +1,30 @@
+[binance]
+api_key = YOUR_API_KEY_HERE
+api_secret = YOUR_API_SECRET_HERE
+testnet = True
+
+[azure]
+connection_string = YOUR_CONNECTION_STRING
+
+[trading]
+watchlist_size = 5
+rescan_interval_sec = 300
+
+[signals]
+nobi_depth = 10
+nobi_trigger_threshold = 0.4
+ml_model_path = ./models/xgb_model.json
+ml_confidence_threshold = 0.75
+
+[risk]
+kelly_fraction = 0.5
+trailing_stop_atr_multiple = 1.5
+leverage = 10
+warning_margin_ratio = 30
+critical_margin_ratio = 15
+
+[system]
+redis_host = localhost
+redis_port = 6379
+redis_db = 0
+log_level = INFO

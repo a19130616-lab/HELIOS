@@ -1,0 +1,4 @@
+# This file ensures the models directory is created in git
+# Place your trained ML models here:
+# - xgb_model.json (XGBoost model)
+# - xgb_model_scaler.pkl (Feature scaler)
