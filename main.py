@@ -23,6 +23,9 @@ from app.signal_engine import SignalEngine
 from app.risk_manager import RiskManager
 from app.execution_manager import ExecutionManager
 from app.monitoring_agent import MonitoringAgent
+from app.reddit_ingestor import RedditIngestor
+from app.performance_tracker import PerformanceTracker
+from app.health_dashboard import HealthDashboard
 
 class HeliosSystem:
     """
@@ -44,7 +47,10 @@ class HeliosSystem:
         self.signal_engine = None
         self.risk_manager = None
         self.execution_manager = None
+        self.reddit_ingestor = None
         self.monitoring_agent = None
+        self.performance_tracker = None
+        self.health_dashboard = None
         
         # Watchlist management
         self.watchlist = []
@@ -181,11 +187,19 @@ class HeliosSystem:
             self.logger.info("Initializing Signal Engine...")
             self.signal_engine = SignalEngine(self.redis_manager, self.watchlist)
             
+            # Initialize Reddit Ingestor
+            self.logger.info("Initializing Reddit Ingestor...")
+            self.reddit_ingestor = RedditIngestor(self.redis_manager)
+            
+            # Initialize Performance Tracker
+            self.logger.info("Initializing Performance Tracker...")
+            self.performance_tracker = PerformanceTracker(self.redis_manager)
+            
             # Initialize Execution Manager
             self.logger.info("Initializing Execution Manager...")
             self.execution_manager = ExecutionManager(
-                self.api_client, 
-                self.risk_manager, 
+                self.api_client,
+                self.risk_manager,
                 self.redis_manager
             )
             
@@ -195,7 +209,18 @@ class HeliosSystem:
                 self.data_ingestor,
                 self.signal_engine,
                 self.risk_manager,
-                self.execution_manager
+                self.execution_manager,
+                self.reddit_ingestor,
+                self.performance_tracker
+            )
+            
+            # Initialize Health Dashboard
+            self.logger.info("Initializing Health Dashboard...")
+            dashboard_port = self.config.get('system', 'dashboard_port', int, 8080)
+            self.health_dashboard = HealthDashboard(
+                self.redis_manager,
+                system_reference=self,
+                port=dashboard_port
             )
             
             self.logger.info("All components initialized")
@@ -219,9 +244,12 @@ class HeliosSystem:
             # Start components in order
             self.risk_manager.start()
             self.data_ingestor.start()
+            self.reddit_ingestor.start()
+            self.performance_tracker.start()
             self.signal_engine.start()
             self.execution_manager.start()
             self.monitoring_agent.start()
+            self.health_dashboard.start()
             
             # Start dynamic watchlist management
             self._start_watchlist_management()
@@ -252,9 +280,12 @@ class HeliosSystem:
         
         # Stop components in reverse order
         components = [
+            ("Health Dashboard", self.health_dashboard),
             ("Monitoring Agent", self.monitoring_agent),
             ("Execution Manager", self.execution_manager),
             ("Signal Engine", self.signal_engine),
+            ("Performance Tracker", self.performance_tracker),
+            ("Reddit Ingestor", self.reddit_ingestor),
             ("Data Ingestor", self.data_ingestor),
             ("Risk Manager", self.risk_manager)
         ]
@@ -360,10 +391,13 @@ class HeliosSystem:
             
             components = {
                 'data_ingestor': self.data_ingestor,
+                'reddit_ingestor': self.reddit_ingestor,
+                'performance_tracker': self.performance_tracker,
                 'signal_engine': self.signal_engine,
                 'risk_manager': self.risk_manager,
                 'execution_manager': self.execution_manager,
-                'monitoring_agent': self.monitoring_agent
+                'monitoring_agent': self.monitoring_agent,
+                'health_dashboard': self.health_dashboard
             }
             
             unhealthy_components = []
@@ -396,7 +430,7 @@ class HeliosSystem:
                 "🚀 HELIOS TRADING SYSTEM - OPERATIONAL 🚀",
                 "=" * 50,
                 f"Trading Symbols: {', '.join(self.watchlist)}",
-                f"Components Running: 5/5",
+                f"Components Running: 8/8",
                 f"Risk Management: ACTIVE",
                 f"API Mode: {'TESTNET' if self.config.get('binance', 'testnet', bool) else 'MAINNET'}",
                 "=" * 50,
@@ -430,10 +464,13 @@ class HeliosSystem:
             # Get component status
             components = {
                 'data_ingestor': self.data_ingestor,
+                'reddit_ingestor': self.reddit_ingestor,
+                'performance_tracker': self.performance_tracker,
                 'signal_engine': self.signal_engine,
                 'risk_manager': self.risk_manager,
                 'execution_manager': self.execution_manager,
-                'monitoring_agent': self.monitoring_agent
+                'monitoring_agent': self.monitoring_agent,
+                'health_dashboard': self.health_dashboard
             }
             
             for name, component in components.items():

@@ -29,7 +29,7 @@ class MonitoringAgent:
     Integrates with Azure Monitor for cloud-based observability.
     """
     
-    def __init__(self, data_ingestor=None, signal_engine=None, risk_manager=None, execution_manager=None):
+    def __init__(self, data_ingestor=None, signal_engine=None, risk_manager=None, execution_manager=None, reddit_ingestor=None, performance_tracker=None):
         """
         Initialize the Monitoring Agent.
         
@@ -38,11 +38,15 @@ class MonitoringAgent:
             signal_engine: Signal engine instance
             risk_manager: Risk manager instance
             execution_manager: Execution manager instance
+            reddit_ingestor: Reddit ingestor instance
+            performance_tracker: Performance tracker instance
         """
         self.data_ingestor = data_ingestor
         self.signal_engine = signal_engine
         self.risk_manager = risk_manager
         self.execution_manager = execution_manager
+        self.reddit_ingestor = reddit_ingestor
+        self.performance_tracker = performance_tracker
         
         self.config = get_config()
         self.logger = logging.getLogger(__name__)
@@ -285,7 +289,9 @@ class MonitoringAgent:
                 'data_ingestor': self._get_component_health(self.data_ingestor),
                 'signal_engine': self._get_component_health(self.signal_engine),
                 'risk_manager': self._get_component_health(self.risk_manager),
-                'execution_manager': self._get_component_health(self.execution_manager)
+                'execution_manager': self._get_component_health(self.execution_manager),
+                'reddit_ingestor': self._get_component_health(self.reddit_ingestor),
+                'performance_tracker': self._get_component_health(self.performance_tracker)
             }
             
             # Calculate overall health score
@@ -318,7 +324,14 @@ class MonitoringAgent:
     def _count_running_components(self) -> int:
         """Count how many components are running."""
         count = 0
-        components = [self.data_ingestor, self.signal_engine, self.risk_manager, self.execution_manager]
+        components = [
+            self.data_ingestor,
+            self.signal_engine,
+            self.risk_manager,
+            self.execution_manager,
+            self.reddit_ingestor,
+            self.performance_tracker
+        ]
         
         for component in components:
             if component and getattr(component, 'is_running', False):
@@ -484,7 +497,9 @@ class MonitoringAgent:
                 'data_ingestor': self.data_ingestor,
                 'signal_engine': self.signal_engine,
                 'risk_manager': self.risk_manager,
-                'execution_manager': self.execution_manager
+                'execution_manager': self.execution_manager,
+                'reddit_ingestor': self.reddit_ingestor,
+                'performance_tracker': self.performance_tracker
             }
             
             for name, component in components.items():
@@ -513,7 +528,7 @@ class MonitoringAgent:
             
             # System metrics
             if self.system_metrics:
-                summary_lines.append(f"System: {self.system_metrics.get('components_running', 0)}/4 components running")
+                summary_lines.append(f"System: {self.system_metrics.get('components_running', 0)}/6 components running")
                 summary_lines.append(f"Memory: {self.system_metrics.get('memory_usage_mb', 0):.1f} MB")
             
             # Performance metrics

@@ -28,3 +28,44 @@ redis_host = localhost
 redis_port = 6379
 redis_db = 0
 log_level = INFO
+dashboard_port = 8080
+
+[reddit]
+enabled = False
+client_id = YOUR_REDDIT_CLIENT_ID
+client_secret = YOUR_REDDIT_CLIENT_SECRET
+user_agent = HeliosRedditAgent/1.0
+subreddits = CryptoCurrency,Bitcoin,CryptoMarkets,ethtrader
+poll_interval_sec = 120
+max_posts_per_fetch = 50
+score_min = 5
+hours_lookback = 24
+
+[sentiment]
+enabled = False
+positive_threshold = 0.3
+negative_threshold = -0.3
+decay_half_life_sec = 1800
+min_posts_window = 10
+sentiment_weight = 0.3
+
+[trend]
+enabled = True
+timeframes = 5m,15m,1h
+ema_short = 21
+ema_long = 55
+momentum_lookback = 14
+trend_alignment_required = True
+atr_period = 14
+volatility_low_percentile = 25
+volatility_high_percentile = 75
+
+[performance]
+report_interval_minutes = 30
+max_trades_memory = 1000
+enable_daily_reports = true
+enable_drawdown_alerts = true
+drawdown_alert_threshold = 10.0
+save_interval_sec = 300
+enable_detailed_metrics = True
+pnl_snapshot_interval_sec = 60

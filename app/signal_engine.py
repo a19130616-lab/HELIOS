@@ -14,7 +14,9 @@ from queue import Queue
 import xgboost as xgb
 
 from app.models import TradingSignal, SignalDirection, OrderBookSnapshot, MarketRegime
-from app.utils import RedisManager, calculate_nobi, calculate_ema, calculate_rsi, get_timestamp, CircularBuffer
+from app.utils import (RedisManager, calculate_nobi, calculate_ema, calculate_rsi, get_timestamp, CircularBuffer,
+                       calculate_slope, classify_trend, calculate_momentum, calculate_multi_timeframe_trend,
+                       calculate_trend_alignment)
 from app.config_manager import get_config
 
 class SignalEngine:
@@ -317,6 +319,43 @@ class SignalEngine:
                 features.append(volumes[-1] / np.mean(volumes) if np.mean(volumes) > 0 else 1.0)
             else:
                 features.extend([0.0, 1.0])
+            
+            # Sentiment features
+            sentiment_data = self.redis_manager.get_data(f"sentiment:{symbol}")
+            if sentiment_data:
+                features.append(sentiment_data.get('weighted_sentiment', 0.0))
+                features.append(sentiment_data.get('sentiment_strength', 0.0))
+                features.append(sentiment_data.get('post_count', 0) / 100.0)  # Normalize post count
+            else:
+                features.extend([0.0, 0.0, 0.0])  # Default neutral sentiment
+            
+            # Enhanced trend analysis features
+            if len(prices) >= 20:
+                # Multi-timeframe trend analysis
+                short_trend = calculate_multi_timeframe_trend(prices[-10:], [5, 10])
+                medium_trend = calculate_multi_timeframe_trend(prices[-20:], [10, 20])
+                
+                # Trend alignment score
+                alignment = calculate_trend_alignment([short_trend, medium_trend])
+                features.append(alignment)
+                
+                # Momentum features
+                momentum_5 = calculate_momentum(prices, 5)
+                momentum_10 = calculate_momentum(prices, 10)
+                features.append(momentum_5)
+                features.append(momentum_10)
+                
+                # Trend classification
+                trend_class = classify_trend(prices[-20:])
+                features.append(1.0 if trend_class == 'bullish' else (-1.0 if trend_class == 'bearish' else 0.0))
+                
+                # Slope features
+                short_slope = calculate_slope(prices[-5:])
+                medium_slope = calculate_slope(prices[-10:])
+                features.append(short_slope)
+                features.append(medium_slope)
+            else:
+                features.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # Default trend features
             
             # Time-based features
             current_time = get_timestamp()

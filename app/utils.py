@@ -364,3 +364,297 @@ class CircularBuffer:
     def is_full(self) -> bool:
         """Check if buffer is full."""
         return self.count == self.size
+
+# Enhanced Trend Analysis Functions
+
+def calculate_slope(prices: List[float], lookback: int = 14) -> float:
+    """
+    Calculate the slope of price movement over a lookback period.
+    
+    Args:
+        prices: List of price values
+        lookback: Number of periods to look back
+        
+    Returns:
+        Slope value (positive = uptrend, negative = downtrend)
+    """
+    if len(prices) < lookback:
+        return 0.0
+    
+    recent_prices = prices[-lookback:]
+    x = list(range(len(recent_prices)))
+    y = recent_prices
+    
+    # Simple linear regression
+    n = len(x)
+    sum_x = sum(x)
+    sum_y = sum(y)
+    sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+    sum_x_squared = sum(xi * xi for xi in x)
+    
+    if n * sum_x_squared - sum_x * sum_x == 0:
+        return 0.0
+    
+    slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x_squared - sum_x * sum_x)
+    return slope
+
+
+def classify_trend(short_ema: float, long_ema: float, slope: float, 
+                  slope_threshold: float = 0.001) -> int:
+    """
+    Classify trend direction based on EMAs and slope.
+    
+    Args:
+        short_ema: Short-period EMA value
+        long_ema: Long-period EMA value
+        slope: Price slope
+        slope_threshold: Minimum slope for trend confirmation
+        
+    Returns:
+        1 for uptrend, -1 for downtrend, 0 for sideways
+    """
+    # EMA trend
+    if short_ema > long_ema and slope > slope_threshold:
+        return 1  # Uptrend
+    elif short_ema < long_ema and slope < -slope_threshold:
+        return -1  # Downtrend
+    else:
+        return 0  # Sideways
+
+
+def calculate_momentum(prices: List[float], period: int = 14) -> float:
+    """
+    Calculate momentum as rate of change.
+    
+    Args:
+        prices: List of price values
+        period: Momentum period
+        
+    Returns:
+        Momentum value as percentage change
+    """
+    if len(prices) < period + 1:
+        return 0.0
+    
+    current_price = prices[-1]
+    past_price = prices[-(period + 1)]
+    
+    if past_price == 0:
+        return 0.0
+    
+    return (current_price - past_price) / past_price * 100
+
+
+def calculate_volatility_percentile(atr_values: List[float], current_atr: float) -> float:
+    """
+    Calculate the percentile of current ATR relative to historical ATR values.
+    
+    Args:
+        atr_values: Historical ATR values
+        current_atr: Current ATR value
+        
+    Returns:
+        Percentile (0-100)
+    """
+    if not atr_values or len(atr_values) < 10:
+        return 50.0  # Default to median
+    
+    sorted_atr = sorted(atr_values)
+    
+    # Find position of current ATR
+    position = 0
+    for atr in sorted_atr:
+        if current_atr > atr:
+            position += 1
+        else:
+            break
+    
+    percentile = (position / len(sorted_atr)) * 100
+    return min(max(percentile, 0.0), 100.0)
+
+
+def classify_volatility_regime(atr_percentile: float, low_threshold: float = 25.0, 
+                              high_threshold: float = 75.0) -> str:
+    """
+    Classify volatility regime based on ATR percentile.
+    
+    Args:
+        atr_percentile: ATR percentile (0-100)
+        low_threshold: Low volatility threshold
+        high_threshold: High volatility threshold
+        
+    Returns:
+        'low', 'normal', or 'high' volatility regime
+    """
+    if atr_percentile < low_threshold:
+        return 'low'
+    elif atr_percentile > high_threshold:
+        return 'high'
+    else:
+        return 'normal'
+
+
+def calculate_multi_timeframe_trend(klines_data: Dict[str, List], 
+                                   short_period: int = 21, 
+                                   long_period: int = 55) -> Dict[str, int]:
+    """
+    Calculate trend direction across multiple timeframes.
+    
+    Args:
+        klines_data: Dictionary with timeframe keys and kline lists
+        short_period: Short EMA period
+        long_period: Long EMA period
+        
+    Returns:
+        Dictionary with trend direction for each timeframe
+    """
+    trends = {}
+    
+    for timeframe, klines in klines_data.items():
+        if not klines or len(klines) < long_period:
+            trends[timeframe] = 0
+            continue
+        
+        # Extract closing prices
+        closes = [float(kline[4]) for kline in klines]  # Assuming [open, high, low, close, volume, ...]
+        
+        # Calculate EMAs
+        short_ema = calculate_ema(closes, short_period)
+        long_ema = calculate_ema(closes, long_period)
+        
+        # Calculate slope
+        slope = calculate_slope(closes, 14)
+        
+        # Classify trend
+        trend = classify_trend(short_ema, long_ema, slope)
+        trends[timeframe] = trend
+    
+    return trends
+
+
+def calculate_trend_alignment(trends: Dict[str, int], 
+                            required_timeframes: List[str] = None) -> Dict[str, any]:
+    """
+    Calculate trend alignment across timeframes.
+    
+    Args:
+        trends: Dictionary of trend directions by timeframe
+        required_timeframes: List of timeframes that must agree
+        
+    Returns:
+        Dictionary with alignment metrics
+    """
+    if not trends:
+        return {
+            'aligned': False,
+            'alignment_score': 0.0,
+            'majority_trend': 0,
+            'agreement_ratio': 0.0
+        }
+    
+    # Filter to required timeframes if specified
+    if required_timeframes:
+        filtered_trends = {tf: trends[tf] for tf in required_timeframes if tf in trends}
+    else:
+        filtered_trends = trends
+    
+    if not filtered_trends:
+        return {
+            'aligned': False,
+            'alignment_score': 0.0,
+            'majority_trend': 0,
+            'agreement_ratio': 0.0
+        }
+    
+    trend_values = list(filtered_trends.values())
+    
+    # Count trend directions
+    uptrend_count = trend_values.count(1)
+    downtrend_count = trend_values.count(-1)
+    sideways_count = trend_values.count(0)
+    
+    total_timeframes = len(trend_values)
+    
+    # Determine majority trend
+    if uptrend_count > downtrend_count and uptrend_count > sideways_count:
+        majority_trend = 1
+        agreement_count = uptrend_count
+    elif downtrend_count > uptrend_count and downtrend_count > sideways_count:
+        majority_trend = -1
+        agreement_count = downtrend_count
+    else:
+        majority_trend = 0
+        agreement_count = sideways_count
+    
+    # Calculate alignment metrics
+    agreement_ratio = agreement_count / total_timeframes
+    alignment_score = agreement_ratio * abs(majority_trend) if majority_trend != 0 else agreement_ratio * 0.5
+    
+    # Consider aligned if majority agrees and it's a strong trend
+    aligned = agreement_ratio >= 0.6 and majority_trend != 0
+    
+    return {
+        'aligned': aligned,
+        'alignment_score': alignment_score,
+        'majority_trend': majority_trend,
+        'agreement_ratio': agreement_ratio,
+        'uptrend_count': uptrend_count,
+        'downtrend_count': downtrend_count,
+        'sideways_count': sideways_count,
+        'timeframes_analyzed': list(filtered_trends.keys())
+    }
+
+
+def calculate_trend_strength(price_data: List[float], volume_data: List[float] = None, 
+                           period: int = 14) -> float:
+    """
+    Calculate trend strength based on price movement and volume.
+    
+    Args:
+        price_data: List of price values
+        volume_data: Optional list of volume values
+        period: Calculation period
+        
+    Returns:
+        Trend strength (0-1, higher = stronger trend)
+    """
+    if len(price_data) < period:
+        return 0.0
+    
+    recent_prices = price_data[-period:]
+    
+    # Calculate price momentum
+    momentum = calculate_momentum(recent_prices, period // 2)
+    momentum_strength = min(abs(momentum) / 10.0, 1.0)  # Normalize to 0-1
+    
+    # Calculate consistency (lower volatility relative to trend = higher strength)
+    slope = calculate_slope(recent_prices, period)
+    
+    if len(recent_prices) > 1:
+        price_changes = [abs(recent_prices[i] - recent_prices[i-1]) for i in range(1, len(recent_prices))]
+        avg_change = sum(price_changes) / len(price_changes) if price_changes else 0
+        
+        # Trend strength is momentum relative to average volatility
+        if avg_change > 0:
+            consistency = abs(slope) / avg_change
+            consistency = min(consistency, 1.0)
+        else:
+            consistency = 1.0 if slope != 0 else 0.0
+    else:
+        consistency = 0.0
+    
+    # Volume confirmation (if available)
+    volume_confirmation = 1.0
+    if volume_data and len(volume_data) >= period:
+        recent_volumes = volume_data[-period:]
+        volume_trend = calculate_slope(recent_volumes, period // 2)
+        
+        # Strong trends should have increasing volume
+        if (slope > 0 and volume_trend > 0) or (slope < 0 and volume_trend > 0):
+            volume_confirmation = 1.2
+        elif (slope > 0 and volume_trend < 0) or (slope < 0 and volume_trend < 0):
+            volume_confirmation = 0.8
+    
+    # Combine metrics
+    strength = (momentum_strength * 0.4 + consistency * 0.6) * volume_confirmation
+    return min(max(strength, 0.0), 1.0)

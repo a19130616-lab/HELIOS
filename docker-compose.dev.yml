@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  helios-app:
+    build:
+      target: development
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - ./models:/app/models
+    environment:
+      - LOG_LEVEL=DEBUG
+      - PYTHONPATH=/app
+    command: python main.py
+    stdin_open: true
+    tty: true
+    ports:
+      - "8080:8080"  # Expose port for potential debugging/monitoring interface
+
+  redis-commander:
+    profiles: []  # Always include in dev mode

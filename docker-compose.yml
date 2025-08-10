@@ -1,0 +1,120 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: helios-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - helios-network
+
+  helios-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: helios-trading-app
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # System configuration
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - LOG_LEVEL=INFO
+      
+      # Binance API (set these in .env file)
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - BINANCE_TESTNET=${BINANCE_TESTNET:-True}
+      
+      # Reddit API (optional - set these in .env file)
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT:-HeliosRedditAgent/1.0}
+      - REDDIT_ENABLED=${REDDIT_ENABLED:-False}
+      
+      # Sentiment Analysis
+      - SENTIMENT_ENABLED=${SENTIMENT_ENABLED:-False}
+      
+      # Azure Monitor (optional)
+      - AZURE_CONNECTION_STRING=${AZURE_CONNECTION_STRING}
+      
+      # Trading configuration
+      - WATCHLIST_SIZE=${WATCHLIST_SIZE:-5}
+      - LEVERAGE=${LEVERAGE:-10}
+      - KELLY_FRACTION=${KELLY_FRACTION:-0.5}
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./config/config.ini:/app/config/config.ini:ro
+    networks:
+      - helios-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r = redis.Redis(host='redis', port=6379, db=0); r.ping()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # Optional: Redis Commander for Redis management
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: helios-redis-commander
+    restart: unless-stopped
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - helios-network
+    profiles:
+      - debug
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  helios-network:
+    driver: bridge
+
+# Development override
+# Use: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+---
+# docker-compose.dev.yml content (for development)
+version: '3.8'
+
+services:
+  helios-app:
+    build:
+      target: development
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - ./models:/app/models
+    environment:
+      - LOG_LEVEL=DEBUG
+      - PYTHONPATH=/app
+    command: python main.py
+    stdin_open: true
+    tty: true
+    ports:
+      - "8080:8080"  # Expose port for potential debugging/monitoring interface
+
+  redis-commander:
+    profiles: []  # Always include in dev mode

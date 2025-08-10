@@ -26,6 +26,11 @@ pytz>=2021.1
 # System monitoring
 psutil>=5.8.0
 
+# Reddit and sentiment analysis
+praw>=7.7.0
+vaderSentiment>=3.3.0
+nltk>=3.8.0
+
 # Development and testing (optional)
 pytest>=6.0.0
 pytest-asyncio>=0.15.0

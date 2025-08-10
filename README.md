@@ -7,6 +7,8 @@ A sophisticated, AI-powered cryptocurrency trading bot designed for minute-level
 ### Core Strategy
 - **Normalized Order Book Imbalance (NOBI)**: Real-time analysis of order book pressure to identify trading opportunities
 - **AI-Powered Signal Filtering**: LSTM+XGBoost hybrid model for sophisticated signal validation
+- **Reddit Sentiment Analysis**: Real-time sentiment analysis from cryptocurrency-related subreddits
+- **Enhanced Trend Analysis**: Multi-timeframe trend detection with momentum indicators
 - **Dynamic Asset Selection**: Automated scanning for optimal volatility-liquidity balance
 - **Market Regime Detection**: Adaptive strategy parameters based on market conditions
 
@@ -112,27 +114,75 @@ connection_string = your_azure_monitor_connection_string
 
 ## 🏃‍♂️ Running the System
 
-### 1. Start Redis (if not running)
-```bash
-redis-server
-```
+### Option 1: Docker (Recommended)
 
-### 2. Create Required Directories
-```bash
-mkdir -p logs models
-```
+**Prerequisites:**
+- Docker and Docker Compose installed
 
-### 3. Prepare ML Model (Optional)
-If you have a trained XGBoost model, place it in the `models/` directory:
-```bash
-cp your_model.json models/xgb_model.json
-cp your_scaler.pkl models/xgb_model_scaler.pkl
-```
+**Steps:**
+1. **Configure Environment Variables**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your API keys and settings
+   ```
 
-### 4. Start Helios
-```bash
-python main.py
-```
+2. **Configure Settings**
+   ```bash
+   cp config/config.ini.template config/config.ini
+   # Edit config/config.ini with your preferences
+   ```
+
+3. **Run with Docker Compose**
+   ```bash
+   # Production mode
+   docker-compose up -d
+   
+   # Development mode (with live code reloading)
+   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+   
+   # With Redis Commander for database management
+   docker-compose --profile debug up -d
+   ```
+
+4. **Monitor Logs**
+   ```bash
+   docker-compose logs -f helios-app
+   ```
+
+5. **Stop the System**
+   ```bash
+   docker-compose down
+   ```
+
+### Option 2: Local Installation
+
+**Prerequisites:**
+- Python 3.9+
+- Redis Server
+
+**Steps:**
+
+1. **Start Redis (if not running)**
+   ```bash
+   redis-server
+   ```
+
+2. **Create Required Directories**
+   ```bash
+   mkdir -p logs models
+   ```
+
+3. **Prepare ML Model (Optional)**
+   If you have a trained XGBoost model, place it in the `models/` directory:
+   ```bash
+   cp your_model.json models/xgb_model.json
+   cp your_scaler.pkl models/xgb_model_scaler.pkl
+   ```
+
+4. **Start Helios**
+   ```bash
+   python main.py
+   ```
 
 ## 📊 System Components
 
@@ -141,8 +191,14 @@ python main.py
 - Processes order book, trade, and kline data
 - Stores normalized data in Redis for other components
 
+### Reddit Ingestor
+- Monitors cryptocurrency-related subreddits
+- Performs sentiment analysis on posts and comments
+- Integrates sentiment data with trading signals
+
 ### Signal Engine
 - Calculates NOBI from real-time order book data
+- Integrates sentiment and enhanced trend analysis
 - Applies ML model for signal validation
 - Publishes trading signals to execution queue
 
