@@ -6,6 +6,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV NLTK_DATA=/app/nltk_data
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -26,6 +27,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Download NLTK data as root user (before switching to non-root)
+RUN python -c "import nltk; nltk.download('punkt', download_dir='/app/nltk_data'); nltk.download('vader_lexicon', download_dir='/app/nltk_data'); nltk.download('stopwords', download_dir='/app/nltk_data')"
+
 # Production stage
 FROM base as production
 
@@ -34,8 +38,8 @@ COPY app/ ./app/
 COPY config/ ./config/
 COPY main.py .
 
-# Create necessary directories
-RUN mkdir -p logs models && \
+# Create necessary directories and set permissions
+RUN mkdir -p logs models nltk_data && \
     chown -R helios:helios /app
 
 # Switch to non-root user
@@ -65,8 +69,8 @@ RUN pip install --no-cache-dir \
 # Copy application code
 COPY . .
 
-# Create directories
-RUN mkdir -p logs models && \
+# Create directories and set permissions
+RUN mkdir -p logs models nltk_data && \
     chown -R helios:helios /app
 
 # Switch to non-root user

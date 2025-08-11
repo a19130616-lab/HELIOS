@@ -21,19 +21,25 @@ try:
     from nltk.tokenize import word_tokenize
     NLTK_AVAILABLE = True
     
-    # Download required NLTK data
+    # Check for NLTK data availability - should be pre-downloaded in Docker
     try:
         nltk.data.find('tokenizers/punkt')
+        PUNKT_AVAILABLE = True
     except LookupError:
-        nltk.download('punkt', quiet=True)
+        PUNKT_AVAILABLE = False
+        logging.warning("NLTK punkt tokenizer not available - using basic tokenization")
     
     try:
         nltk.data.find('corpora/stopwords')
+        STOPWORDS_AVAILABLE = True
     except LookupError:
-        nltk.download('stopwords', quiet=True)
+        STOPWORDS_AVAILABLE = False
+        logging.warning("NLTK stopwords not available - using basic word filtering")
         
 except ImportError:
     NLTK_AVAILABLE = False
+    PUNKT_AVAILABLE = False
+    STOPWORDS_AVAILABLE = False
     logging.warning("NLTK not available for text preprocessing")
 
 
@@ -85,13 +91,32 @@ class SentimentAnalyzer:
         ]
         
         # Stop words for filtering
-        if NLTK_AVAILABLE:
+        if NLTK_AVAILABLE and STOPWORDS_AVAILABLE:
             try:
                 self.stop_words = set(stopwords.words('english'))
             except:
-                self.stop_words = set()
+                self.stop_words = self._get_basic_stopwords()
         else:
-            self.stop_words = set()
+            self.stop_words = self._get_basic_stopwords()
+    
+    def _get_basic_stopwords(self) -> set:
+        """
+        Get basic English stopwords for fallback when NLTK is not available.
+        
+        Returns:
+            Set of basic English stopwords
+        """
+        return {
+            'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours',
+            'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers',
+            'herself', 'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves',
+            'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are',
+            'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does',
+            'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until',
+            'while', 'of', 'at', 'by', 'for', 'with', 'through', 'during', 'before', 'after',
+            'above', 'below', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again',
+            'further', 'then', 'once'
+        }
     
     def preprocess_text(self, text: str) -> str:
         """
