@@ -39,20 +39,25 @@ class RedditIngestor:
         self.redis_manager = redis_manager
         self.config = get_config()
         self.logger = logging.getLogger(__name__)
+        self.is_running = False
+        self.posts_fetched = 0
+        self.posts_processed = 0
         
         # Reddit configuration
-        self.enabled = self.config.get('reddit', 'enabled', bool, fallback=False)
+        self.enabled = self.config.get('reddit', 'enabled', bool, False)
         
         if not self.enabled:
             self.logger.info("Reddit ingestion disabled in configuration")
             self.reddit = None
             self.sentiment_analyzer = None
+            self.sentiment_enabled = False
             return
         
         if not PRAW_AVAILABLE:
             self.logger.error("PRAW not available - cannot initialize Reddit ingestion")
             self.reddit = None
             self.sentiment_analyzer = None
+            self.sentiment_enabled = False
             return
         
         # Reddit API credentials
@@ -62,10 +67,10 @@ class RedditIngestor:
         
         # Reddit settings
         self.subreddits = self.config.get('reddit', 'subreddits', str).split(',')
-        self.poll_interval = self.config.get('reddit', 'poll_interval_sec', int, fallback=120)
-        self.max_posts_per_fetch = self.config.get('reddit', 'max_posts_per_fetch', int, fallback=50)
-        self.score_min = self.config.get('reddit', 'score_min', int, fallback=5)
-        self.hours_lookback = self.config.get('reddit', 'hours_lookback', int, fallback=24)
+        self.poll_interval = self.config.get('reddit', 'poll_interval_sec', int, 120)
+        self.max_posts_per_fetch = self.config.get('reddit', 'max_posts_per_fetch', int, 50)
+        self.score_min = self.config.get('reddit', 'score_min', int, 5)
+        self.hours_lookback = self.config.get('reddit', 'hours_lookback', int, 24)
         
         # Initialize Reddit client
         self.reddit = None
@@ -73,7 +78,6 @@ class RedditIngestor:
         self._initialize_reddit_client()
         
         # Ingestion state
-        self.is_running = False
         self.processed_posts: Set[str] = set()
         
         # Performance tracking
@@ -83,12 +87,12 @@ class RedditIngestor:
         self.last_fetch_time = 0
         
         # Sentiment configuration
-        self.sentiment_enabled = self.config.get('sentiment', 'enabled', bool, fallback=False)
+        self.sentiment_enabled = self.config.get('sentiment', 'enabled', bool, False)
         if self.sentiment_enabled:
             self.sentiment_analyzer = SentimentAnalyzer()
         
-        self.decay_half_life = self.config.get('sentiment', 'decay_half_life_sec', float, fallback=1800.0)
-        self.min_posts_window = self.config.get('sentiment', 'min_posts_window', int, fallback=10)
+        self.decay_half_life = self.config.get('sentiment', 'decay_half_life_sec', float, 1800.0)
+        self.min_posts_window = self.config.get('sentiment', 'min_posts_window', int, 10)
     
     def _initialize_reddit_client(self) -> None:
         """Initialize the Reddit API client."""

@@ -9,6 +9,8 @@ import json
 import logging
 import threading
 import time
+import random
+import os
 from typing import List, Dict, Any, Optional, Callable
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
@@ -22,18 +24,24 @@ class DataIngestor:
     Processes order book, trade, and kline data and stores in Redis for other services.
     """
     
-    def __init__(self, symbols: List[str], redis_manager: RedisManager):
+    def __init__(self, symbols: List[str], redis_manager: RedisManager, api_client=None):
         """
         Initialize the Data Ingestor.
         
         Args:
             symbols: List of trading symbols to monitor
             redis_manager: Redis manager instance
+            api_client: Binance API client (None for demo mode)
         """
         self.symbols = symbols
         self.redis_manager = redis_manager
         self.config = get_config()
         self.logger = logging.getLogger(__name__)
+        self.api_client = api_client
+        
+        # Check for demo mode
+        self.demo_mode = (api_client is None or
+                         os.getenv('DEMO_MODE', 'false').lower() == 'true')
         
         # WebSocket client
         self.ws_client = None
@@ -48,17 +56,30 @@ class DataIngestor:
         
         # Stream IDs for cleanup
         self.stream_ids = []
+        
+        # Demo mode data generation
+        self.demo_thread = None
+        self.demo_prices = {}  # Track simulated prices for each symbol
+        
+        if self.demo_mode:
+            self.logger.warning("🔸 Data Ingestor running in DEMO MODE - Using simulated market data")
+            self._initialize_demo_prices()
     
     def start(self) -> None:
         """Start the data ingestion process."""
         self.logger.info("Starting Data Ingestor...")
         self.is_running = True
         
-        # Start WebSocket client in a separate thread
-        self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
-        self.ws_thread.start()
-        
-        self.logger.info(f"Data Ingestor started for symbols: {self.symbols}")
+        if self.demo_mode:
+            # Start demo data generation
+            self.demo_thread = threading.Thread(target=self._run_demo_mode, daemon=True)
+            self.demo_thread.start()
+            self.logger.info(f"🔸 Data Ingestor started in DEMO MODE for symbols: {self.symbols}")
+        else:
+            # Start WebSocket client in a separate thread
+            self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
+            self.ws_thread.start()
+            self.logger.info(f"Data Ingestor started for symbols: {self.symbols}")
     
     def stop(self) -> None:
         """Stop the data ingestion process."""
@@ -397,5 +418,142 @@ class DataIngestor:
             'reconnect_attempts': self.reconnect_attempts,
             'order_books_active': len(self.order_books),
             'latest_trades_active': len(self.latest_trades),
-            'websocket_connected': self.ws_client is not None
+            'websocket_connected': self.ws_client is not None,
+            'demo_mode': self.demo_mode
         }
+
+    def _initialize_demo_prices(self) -> None:
+        """Initialize demo prices for simulation."""
+        # Realistic starting prices for major crypto pairs
+        demo_prices = {
+            'BTCUSDT': 45000.0,
+            'ETHUSDT': 2800.0,
+            'BNBUSDT': 320.0,
+            'ADAUSDT': 1.2,
+            'SOLUSDT': 95.0,
+            'DOTUSDT': 25.0,
+            'AVAXUSDT': 35.0,
+            'MATICUSDT': 0.85
+        }
+        
+        for symbol in self.symbols:
+            if symbol in demo_prices:
+                self.demo_prices[symbol] = demo_prices[symbol]
+            else:
+                # Generate random price for unknown symbols
+                self.demo_prices[symbol] = random.uniform(1.0, 100.0)
+
+    def _run_demo_mode(self) -> None:
+        """Run demo mode with simulated market data."""
+        self.logger.info("🔸 Starting demo data generation...")
+        
+        while self.is_running:
+            try:
+                for symbol in self.symbols:
+                    self._generate_demo_orderbook(symbol)
+                    self._generate_demo_trade(symbol)
+                    
+                    # Generate kline every minute
+                    if int(time.time()) % 60 == 0:
+                        self._generate_demo_kline(symbol)
+                
+                # Update every 100ms to simulate high-frequency data
+                time.sleep(0.1)
+                
+            except Exception as e:
+                self.logger.error(f"Error in demo mode: {e}")
+                time.sleep(1)
+
+    def _generate_demo_orderbook(self, symbol: str) -> None:
+        """Generate simulated order book data."""
+        current_price = self.demo_prices[symbol]
+        
+        # Add some random price movement (-0.1% to +0.1%)
+        price_change = random.uniform(-0.001, 0.001)
+        new_price = current_price * (1 + price_change)
+        self.demo_prices[symbol] = new_price
+        
+        # Generate order book levels
+        bids = []
+        asks = []
+        
+        # Generate 20 bid levels below current price
+        for i in range(20):
+            price = new_price * (1 - (i + 1) * 0.0001)
+            quantity = random.uniform(0.1, 10.0)
+            bids.append(OrderBookLevel(price=price, quantity=quantity))
+        
+        # Generate 20 ask levels above current price
+        for i in range(20):
+            price = new_price * (1 + (i + 1) * 0.0001)
+            quantity = random.uniform(0.1, 10.0)
+            asks.append(OrderBookLevel(price=price, quantity=quantity))
+        
+        # Create order book snapshot
+        order_book = OrderBookSnapshot(
+            symbol=symbol,
+            timestamp=get_timestamp(),
+            bids=sorted(bids, key=lambda x: x.price, reverse=True),
+            asks=sorted(asks, key=lambda x: x.price)
+        )
+        
+        # Store in memory and Redis
+        self.order_books[symbol] = order_book
+        self._store_order_book(order_book)
+
+    def _generate_demo_trade(self, symbol: str) -> None:
+        """Generate simulated trade data."""
+        current_price = self.demo_prices[symbol]
+        
+        # Generate trade around current price
+        trade_price = current_price * random.uniform(0.9999, 1.0001)
+        trade_quantity = random.uniform(0.01, 5.0)
+        trade_side = random.choice([OrderSide.BUY, OrderSide.SELL])
+        
+        trade = TradeData(
+            symbol=symbol,
+            timestamp=get_timestamp(),
+            price=trade_price,
+            quantity=trade_quantity,
+            side=trade_side,
+            trade_id=str(int(time.time() * 1000))
+        )
+        
+        # Store latest trade
+        self.latest_trades[symbol] = trade
+        self._store_trade(trade)
+
+    def _generate_demo_kline(self, symbol: str) -> None:
+        """Generate simulated kline data."""
+        current_price = self.demo_prices[symbol]
+        
+        # Generate OHLC data with some volatility
+        open_price = current_price * random.uniform(0.999, 1.001)
+        close_price = current_price * random.uniform(0.999, 1.001)
+        high_price = max(open_price, close_price) * random.uniform(1.0, 1.002)
+        low_price = min(open_price, close_price) * random.uniform(0.998, 1.0)
+        volume = random.uniform(100, 1000)
+        trades = random.randint(50, 200)
+        
+        kline = {
+            'symbol': symbol,
+            'timestamp': get_timestamp(),
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': close_price,
+            'volume': volume,
+            'trades': trades
+        }
+        
+        # Store kline data
+        if symbol not in self.kline_data:
+            self.kline_data[symbol] = []
+        
+        self.kline_data[symbol].append(kline)
+        
+        # Keep only last 200 klines per symbol
+        if len(self.kline_data[symbol]) > 200:
+            self.kline_data[symbol] = self.kline_data[symbol][-200:]
+        
+        self._store_kline(kline)

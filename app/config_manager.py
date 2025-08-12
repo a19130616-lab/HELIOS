@@ -46,7 +46,7 @@ class ConfigManager:
         if self.get('signals', 'nobi_trigger_threshold', float) <= 0 or self.get('signals', 'nobi_trigger_threshold', float) >= 1:
             raise ValueError("NOBI trigger threshold must be between 0 and 1")
     
-    def get(self, section: str, key: str, value_type: type = str) -> Any:
+    def get(self, section: str, key: str, value_type: type = str, fallback: Any = None) -> Any:
         """
         Get a configuration value with type conversion.
         
@@ -54,6 +54,7 @@ class ConfigManager:
             section: Configuration section
             key: Configuration key
             value_type: Type to convert the value to
+            fallback: Default value if key is not found
             
         Returns:
             Configuration value converted to specified type
@@ -71,6 +72,8 @@ class ConfigManager:
                 return value
                 
         except (configparser.NoSectionError, configparser.NoOptionError) as e:
+            if fallback is not None:
+                return fallback
             raise KeyError(f"Configuration key not found: {section}.{key}") from e
     
     def get_section(self, section: str) -> Dict[str, str]:

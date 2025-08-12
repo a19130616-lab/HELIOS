@@ -47,6 +47,9 @@ services:
       # Sentiment Analysis
       - SENTIMENT_ENABLED=${SENTIMENT_ENABLED:-false}
       
+      # Demo Mode (set to true to bypass API validation)
+      - DEMO_MODE=${DEMO_MODE:-true}
+      
       # Azure Monitor (optional)
       - AZURE_CONNECTION_STRING=${AZURE_CONNECTION_STRING}
       

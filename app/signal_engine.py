@@ -331,12 +331,31 @@ class SignalEngine:
             
             # Enhanced trend analysis features
             if len(prices) >= 20:
-                # Multi-timeframe trend analysis
-                short_trend = calculate_multi_timeframe_trend(prices[-10:], [5, 10])
-                medium_trend = calculate_multi_timeframe_trend(prices[-20:], [10, 20])
+                # Multi-timeframe trend analysis using simple EMAs
+                short_prices = prices[-10:]
+                medium_prices = prices[-20:]
                 
-                # Trend alignment score
-                alignment = calculate_trend_alignment([short_trend, medium_trend])
+                # Calculate simple trend direction using EMAs
+                if len(short_prices) >= 5:
+                    short_ema = calculate_ema(short_prices, 5)
+                    short_trend_value = 1 if short_prices[-1] > short_ema else -1
+                else:
+                    short_trend_value = 0
+                
+                if len(medium_prices) >= 10:
+                    medium_ema = calculate_ema(medium_prices, 10)
+                    medium_trend_value = 1 if medium_prices[-1] > medium_ema else -1
+                else:
+                    medium_trend_value = 0
+                
+                # Simple alignment calculation
+                if short_trend_value == medium_trend_value and short_trend_value != 0:
+                    alignment = 1.0  # Strong alignment
+                elif short_trend_value == medium_trend_value and short_trend_value == 0:
+                    alignment = 0.0  # No trend
+                else:
+                    alignment = -0.5  # Conflicting signals
+                
                 features.append(alignment)
                 
                 # Momentum features
@@ -346,8 +365,14 @@ class SignalEngine:
                 features.append(momentum_10)
                 
                 # Trend classification
-                trend_class = classify_trend(prices[-20:])
-                features.append(1.0 if trend_class == 'bullish' else (-1.0 if trend_class == 'bearish' else 0.0))
+                if len(prices) >= 20:
+                    short_ema = calculate_ema(prices[-20:], 10)
+                    long_ema = calculate_ema(prices[-20:], 20)
+                    slope = calculate_slope(prices[-20:], 14)
+                    trend_class = classify_trend(short_ema, long_ema, slope)
+                    features.append(float(trend_class))
+                else:
+                    features.append(0.0)
                 
                 # Slope features
                 short_slope = calculate_slope(prices[-5:])

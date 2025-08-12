@@ -263,6 +263,22 @@ class RedisManager:
         pubsub = self.redis_client.pubsub()
         pubsub.subscribe(channels)
         return pubsub
+    
+    def get_keys(self, pattern: str) -> List[str]:
+        """
+        Get Redis keys matching a pattern.
+        
+        Args:
+            pattern: Key pattern with wildcards
+            
+        Returns:
+            List of matching keys
+        """
+        try:
+            return self.redis_client.keys(pattern)
+        except Exception as e:
+            logging.error(f"Failed to get Redis keys: {e}")
+            return []
 
 def create_binance_signature(query_string: str, secret: str) -> str:
     """

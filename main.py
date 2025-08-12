@@ -124,8 +124,18 @@ class HeliosSystem:
             api_secret = self.config.get('binance', 'api_secret', str)
             testnet = self.config.get('binance', 'testnet', bool)
             
+            # Check for demo mode environment variable
+            demo_mode = os.getenv('DEMO_MODE', 'false').lower() == 'true'
+            
+            if demo_mode:
+                self.logger.warning("🔸 DEMO MODE ENABLED - Using simulated data, no real API connection")
+                self.api_client = None  # Will be handled by data_ingestor in demo mode
+                return
+            
             if api_key == "YOUR_API_KEY_HERE" or api_secret == "YOUR_API_SECRET_HERE":
-                raise ValueError("Please configure your Binance API credentials in config.ini")
+                self.logger.warning("⚠️ Invalid API keys detected - Switching to DEMO MODE")
+                self.api_client = None
+                return
             
             if testnet:
                 base_url = "https://testnet.binancefuture.com"
@@ -141,14 +151,19 @@ class HeliosSystem:
             )
             
             # Test API connection
-            account_info = self.api_client.account()
-            balance = float(account_info['totalWalletBalance'])
-            
-            self.logger.info(f"Binance API connection established - Balance: ${balance:.2f}")
+            try:
+                account_info = self.api_client.account()
+                balance = float(account_info['totalWalletBalance'])
+                self.logger.info(f"Binance API connection established - Balance: ${balance:.2f}")
+            except Exception as api_error:
+                self.logger.warning(f"API validation failed: {api_error}")
+                self.logger.warning("🔸 Switching to DEMO MODE - Using simulated data")
+                self.api_client = None
             
         except Exception as e:
             self.logger.error(f"Failed to initialize Binance API: {e}")
-            raise
+            self.logger.warning("🔸 Falling back to DEMO MODE")
+            self.api_client = None
     
     def _initialize_watchlist(self) -> None:
         """Initialize trading symbol watchlist."""
@@ -156,21 +171,28 @@ class HeliosSystem:
             # Start with popular crypto pairs
             default_watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
             
-            # Validate symbols with exchange
-            exchange_info = self.api_client.exchange_info()
-            available_symbols = [s['symbol'] for s in exchange_info['symbols'] if s['status'] == 'TRADING']
-            
-            # Filter to only available symbols
-            self.watchlist = [symbol for symbol in default_watchlist if symbol in available_symbols]
-            
-            if not self.watchlist:
-                raise ValueError("No valid trading symbols found")
-            
-            self.logger.info(f"Initialized watchlist: {self.watchlist}")
+            if self.api_client is None:
+                # Demo mode - use default watchlist
+                self.watchlist = default_watchlist
+                self.logger.info(f"🔸 Demo mode watchlist: {self.watchlist}")
+            else:
+                # Validate symbols with exchange
+                exchange_info = self.api_client.exchange_info()
+                available_symbols = [s['symbol'] for s in exchange_info['symbols'] if s['status'] == 'TRADING']
+                
+                # Filter to only available symbols
+                self.watchlist = [symbol for symbol in default_watchlist if symbol in available_symbols]
+                
+                if not self.watchlist:
+                    raise ValueError("No valid trading symbols found")
+                
+                self.logger.info(f"Initialized watchlist: {self.watchlist}")
             
         except Exception as e:
             self.logger.error(f"Failed to initialize watchlist: {e}")
-            raise
+            # Fallback to default watchlist in case of error
+            self.watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
+            self.logger.warning(f"Using fallback watchlist: {self.watchlist}")
     
     def _initialize_components(self) -> None:
         """Initialize all system components."""
@@ -181,7 +203,7 @@ class HeliosSystem:
             
             # Initialize Data Ingestor
             self.logger.info("Initializing Data Ingestor...")
-            self.data_ingestor = DataIngestor(self.watchlist, self.redis_manager)
+            self.data_ingestor = DataIngestor(self.watchlist, self.redis_manager, self.api_client)
             
             # Initialize Signal Engine
             self.logger.info("Initializing Signal Engine...")
