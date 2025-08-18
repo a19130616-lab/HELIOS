@@ -12,6 +12,17 @@ import redis
 import numpy as np
 from datetime import datetime
 
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles numpy data types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
 def setup_logging(log_level: str = "INFO") -> None:
     """
     Set up logging configuration for the system.
@@ -203,7 +214,7 @@ class RedisManager:
             True if successful
         """
         try:
-            json_data = json.dumps(data)
+            json_data = json.dumps(data, cls=NumpyEncoder)
             if expiry:
                 return self.redis_client.setex(key, expiry, json_data)
             else:
@@ -243,7 +254,7 @@ class RedisManager:
             True if successful
         """
         try:
-            json_message = json.dumps(message)
+            json_message = json.dumps(message, cls=NumpyEncoder)
             self.redis_client.publish(channel, json_message)
             return True
         except Exception as e:

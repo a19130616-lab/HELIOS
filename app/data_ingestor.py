@@ -61,6 +61,10 @@ class DataIngestor:
         self.demo_thread = None
         self.demo_prices = {}  # Track simulated prices for each symbol
         
+        # Price logging
+        self.price_logging_thread = None
+        self.last_price_log_time = 0
+        
         if self.demo_mode:
             self.logger.warning("🔸 Data Ingestor running in DEMO MODE - Using simulated market data")
             self._initialize_demo_prices()
@@ -69,6 +73,10 @@ class DataIngestor:
         """Start the data ingestion process."""
         self.logger.info("Starting Data Ingestor...")
         self.is_running = True
+        
+        # Start price logging thread for both demo and live modes
+        self.price_logging_thread = threading.Thread(target=self._run_price_logging, daemon=True)
+        self.price_logging_thread.start()
         
         if self.demo_mode:
             # Start demo data generation
@@ -557,3 +565,66 @@ class DataIngestor:
             self.kline_data[symbol] = self.kline_data[symbol][-200:]
         
         self._store_kline(kline)
+
+    def _run_price_logging(self) -> None:
+        """Run periodic price logging every 10 seconds."""
+        self.logger.info("🔸 Starting periodic price logging every 10 seconds...")
+        
+        # Wait 5 seconds for system to initialize
+        time.sleep(5.0)
+        
+        while self.is_running:
+            try:
+                current_time = time.time()
+                
+                # Log prices every 10 seconds
+                if current_time - self.last_price_log_time >= 10.0:
+                    self._log_all_prices()
+                    self.last_price_log_time = current_time
+                
+                # Sleep for 1 second to check time regularly
+                time.sleep(1.0)
+                
+            except Exception as e:
+                self.logger.error(f"Error in price logging: {e}")
+                time.sleep(1.0)
+
+    def _log_all_prices(self) -> None:
+        """Log current prices for all monitored symbols."""
+        price_info = []
+        
+        # Always try to log something to confirm the logging is working
+        mode_indicator = "📊 DEMO" if self.demo_mode else "📈 LIVE"
+        
+        for symbol in self.symbols:
+            try:
+                if self.demo_mode:
+                    # Use demo prices
+                    current_price = self.demo_prices.get(symbol)
+                    if current_price is not None and current_price > 0:
+                        price_info.append(f"{symbol}: ${current_price:.4f}")
+                    else:
+                        price_info.append(f"{symbol}: Initializing...")
+                else:
+                    # Use latest trade price or order book mid price
+                    latest_trade = self.latest_trades.get(symbol)
+                    if latest_trade:
+                        price_info.append(f"{symbol}: ${latest_trade.price:.4f}")
+                    else:
+                        order_book = self.order_books.get(symbol)
+                        if order_book:
+                            mid_price = order_book.get_mid_price()
+                            if mid_price:
+                                price_info.append(f"{symbol}: ${mid_price:.4f}")
+                            else:
+                                price_info.append(f"{symbol}: No mid price")
+                        else:
+                            price_info.append(f"{symbol}: No data")
+            except Exception as e:
+                price_info.append(f"{symbol}: Error({str(e)[:20]})")
+        
+        # Always log, even if no data
+        if price_info:
+            self.logger.info(f"{mode_indicator} MARKET PRICES: {' | '.join(price_info)}")
+        else:
+            self.logger.info(f"{mode_indicator} MARKET PRICES: No symbols configured")

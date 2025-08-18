@@ -318,8 +318,9 @@ class MonitoringAgent:
                 return component.get_health_status()
             return None
         except Exception as e:
-            self.logger.error(f"Error getting component health: {e}")
-            return None
+            component_name = getattr(component, '__class__', {}).get('__name__', 'Unknown')
+            self.logger.error(f"Error getting component health from {component_name}: {e}")
+            return {'is_running': False, 'error': str(e)}
     
     def _count_running_components(self) -> int:
         """Count how many components are running."""

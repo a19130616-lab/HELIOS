@@ -89,6 +89,16 @@ class SignalEngine:
     def _load_ml_model(self) -> None:
         """Load the pre-trained ML model and feature scaler."""
         try:
+            # Check if model path exists
+            if not self.ml_model_path:
+                self.logger.info("No ML model path configured - operating without ML filtering")
+                return
+                
+            import os
+            if not os.path.exists(self.ml_model_path):
+                self.logger.info(f"ML model file not found at {self.ml_model_path} - operating without ML filtering")
+                return
+            
             # Try to load XGBoost model
             self.ml_model = xgb.Booster()
             self.ml_model.load_model(self.ml_model_path)
@@ -106,6 +116,8 @@ class SignalEngine:
         except Exception as e:
             self.logger.error(f"Failed to load ML model: {e}")
             self.logger.warning("Signal Engine will operate without ML filtering")
+            self.ml_model = None
+            self.feature_scaler = None
     
     def _run_signal_loop(self) -> None:
         """Main signal generation loop."""

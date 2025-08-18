@@ -253,23 +253,28 @@ class RiskManager:
             Stop loss price
         """
         try:
-            # Get recent kline data for ATR calculation
-            klines = self.api_client.klines(symbol=symbol, interval="1m", limit=20)
-            
-            if len(klines) < 14:
-                # Fallback to 1% stop loss
+            # Handle demo mode when api_client is None
+            if self.api_client is None:
+                # Use default 1% stop loss in demo mode
                 multiplier = 0.01
             else:
-                # Calculate ATR
-                highs = [float(kline[2]) for kline in klines]
-                lows = [float(kline[3]) for kline in klines]
-                closes = [float(kline[4]) for kline in klines]
+                # Get recent kline data for ATR calculation
+                klines = self.api_client.klines(symbol=symbol, interval="1m", limit=20)
                 
-                atr = calculate_atr(highs, lows, closes)
-                multiplier = atr / entry_price * self.trailing_stop_atr_multiple
-                
-                # Ensure reasonable bounds (0.5% to 3%)
-                multiplier = max(0.005, min(0.03, multiplier))
+                if len(klines) < 14:
+                    # Fallback to 1% stop loss
+                    multiplier = 0.01
+                else:
+                    # Calculate ATR
+                    highs = [float(kline[2]) for kline in klines]
+                    lows = [float(kline[3]) for kline in klines]
+                    closes = [float(kline[4]) for kline in klines]
+                    
+                    atr = calculate_atr(highs, lows, closes)
+                    multiplier = atr / entry_price * self.trailing_stop_atr_multiple
+                    
+                    # Ensure reasonable bounds (0.5% to 3%)
+                    multiplier = max(0.005, min(0.03, multiplier))
             
             if side == OrderSide.BUY:
                 return entry_price * (1 - multiplier)
@@ -305,16 +310,20 @@ class RiskManager:
             
             # Get ATR-based distance
             try:
-                klines = self.api_client.klines(symbol=position.symbol, interval="1m", limit=20)
-                if len(klines) >= 14:
-                    highs = [float(kline[2]) for kline in klines]
-                    lows = [float(kline[3]) for kline in klines]
-                    closes = [float(kline[4]) for kline in klines]
-                    
-                    atr = calculate_atr(highs, lows, closes)
-                    atr_distance = atr * self.trailing_stop_atr_multiple
+                if self.api_client is None:
+                    # Demo mode - use fixed 1% distance
+                    atr_distance = position.high_water_mark * 0.01
                 else:
-                    atr_distance = position.high_water_mark * 0.01  # 1% fallback
+                    klines = self.api_client.klines(symbol=position.symbol, interval="1m", limit=20)
+                    if len(klines) >= 14:
+                        highs = [float(kline[2]) for kline in klines]
+                        lows = [float(kline[3]) for kline in klines]
+                        closes = [float(kline[4]) for kline in klines]
+                        
+                        atr = calculate_atr(highs, lows, closes)
+                        atr_distance = atr * self.trailing_stop_atr_multiple
+                    else:
+                        atr_distance = position.high_water_mark * 0.01  # 1% fallback
             except:
                 atr_distance = position.high_water_mark * 0.01
             
@@ -481,6 +490,11 @@ class RiskManager:
         """Manage trailing stops for all positions."""
         while self.is_running:
             try:
+                # Skip if no API client (demo mode)
+                if self.api_client is None:
+                    time.sleep(5)
+                    continue
+                    
                 for symbol, position in self.positions.items():
                     # Get current price and update trailing stop
                     ticker = self.api_client.ticker_price(symbol=symbol)
@@ -497,6 +511,18 @@ class RiskManager:
     def _get_account_info(self) -> Optional[AccountInfo]:
         """Get current account information."""
         try:
+            # Handle demo mode when api_client is None
+            if self.api_client is None:
+                # Return demo account info
+                return AccountInfo(
+                    total_balance=10000.0,  # Demo balance
+                    available_balance=9000.0,
+                    used_margin=1000.0,
+                    margin_ratio=90.0,
+                    positions=[],
+                    timestamp=get_timestamp()
+                )
+            
             account = self.api_client.account()
             
             total_balance = float(account['totalWalletBalance'])

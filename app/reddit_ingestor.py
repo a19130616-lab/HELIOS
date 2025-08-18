@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 try:
     import praw
-    from praw.exceptions import PrawException
+    from praw.exceptions import PRAWException
     PRAW_AVAILABLE = True
 except ImportError:
     PRAW_AVAILABLE = False
@@ -42,9 +42,14 @@ class RedditIngestor:
         self.is_running = False
         self.posts_fetched = 0
         self.posts_processed = 0
+        self.last_fetch_time = None
+        self.fetch_errors = 0
         
         # Reddit configuration
         self.enabled = self.config.get('reddit', 'enabled', bool, False)
+        
+        # Initialize subreddits as empty list by default
+        self.subreddits = []
         
         if not self.enabled:
             self.logger.info("Reddit ingestion disabled in configuration")
@@ -443,9 +448,9 @@ class RedditIngestor:
             'sentiment_enabled': self.sentiment_enabled,
             'posts_fetched': self.posts_fetched,
             'posts_processed': self.posts_processed,
-            'fetch_errors': self.fetch_errors,
+            'fetch_errors': getattr(self, 'fetch_errors', 0),
             'last_fetch_time': self.last_fetch_time,
-            'processed_posts_count': len(self.processed_posts),
+            'processed_posts_count': len(getattr(self, 'processed_posts', set())),
             'configured_subreddits': self.subreddits if self.enabled else []
         }
     

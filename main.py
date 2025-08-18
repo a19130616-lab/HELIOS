@@ -369,6 +369,11 @@ class HeliosSystem:
     def _update_dynamic_watchlist(self) -> None:
         """Update the watchlist based on market conditions."""
         try:
+            # Skip dynamic watchlist updates in demo mode
+            if self.api_client is None:
+                self.logger.debug("Demo mode: Skipping dynamic watchlist updates")
+                return
+                
             # This is a simplified implementation
             # In the full system, this would analyze volatility and liquidity metrics
             watchlist_size = self.config.get('trading', 'watchlist_size', int)
