@@ -76,6 +76,11 @@ class PublicPriceIngestor:
         if self.is_running:
             return
         self.logger.info("Starting PublicPriceIngestor (public mode)...")
+        
+        # Fetch historical data on startup to fill gaps
+        self.logger.info("Fetching historical data to populate price trends...")
+        self._fetch_historical_data()
+        
         self.is_running = True
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
@@ -83,6 +88,94 @@ class PublicPriceIngestor:
     def stop(self) -> None:
         self.logger.info("Stopping PublicPriceIngestor...")
         self.is_running = False
+
+    def _fetch_historical_data(self) -> None:
+        """
+        Fetch historical klines on startup to populate price history.
+
+        Enhanced logging added to aid diagnosis of empty Redis klines:* lists:
+          - Per-symbol timing, counts, first/last kline timestamps
+          - Redis list length verification after population
+          - Aggregate summary at end
+        """
+        started_at = time.time()
+        total_loaded = 0
+        for symbol in self.symbols:
+            sym_start = time.time()
+            try:
+                self.logger.info(f"[HIST] Fetching last 200 1m klines for {symbol} (futures primary, spot fallback)...")
+
+                klines_json = self._fetch_with_fallback(
+                    primary=lambda: self._get_json(
+                        f"{self.base_primary}/fapi/v1/klines",
+                        params={"symbol": symbol, "interval": "1m", "limit": 200},
+                    ),
+                    fallback=lambda: self._get_json(
+                        f"{self.base_fallback}/api/v3/klines",
+                        params={"symbol": symbol, "interval": "1m", "limit": 200},
+                    ),
+                    context=f"historical_klines:{symbol}",
+                )
+
+                if not klines_json or not isinstance(klines_json, list):
+                    self.logger.warning(f"[HIST] No historical data returned for {symbol} (type={type(klines_json).__name__})")
+                    continue
+
+                count = len(klines_json)
+                self.kline_data[symbol] = []
+                first_ts = None
+                last_ts = None
+
+                for idx, kline_arr in enumerate(klines_json):
+                    try:
+                        ts_val = int(kline_arr[6]) if len(kline_arr) > 6 else int(kline_arr[0])
+                        kline = {
+                            "symbol": symbol,
+                            "timestamp": ts_val,
+                            "open": float(kline_arr[1]),
+                            "high": float(kline_arr[2]),
+                            "low": float(kline_arr[3]),
+                            "close": float(kline_arr[4]),
+                            "volume": float(kline_arr[5]),
+                            "trades": int(kline_arr[8]) if len(kline_arr) > 8 else 0,
+                        }
+                        if first_ts is None or ts_val < first_ts:
+                            first_ts = ts_val
+                        if last_ts is None or ts_val > last_ts:
+                            last_ts = ts_val
+                        self.kline_data[symbol].append(kline)
+                        self._store_kline(kline)
+
+                        # Lightweight progress log every 50 inserts
+                        if (idx + 1) % 50 == 0:
+                            self.logger.debug(f"[HIST] {symbol} inserted {idx + 1}/{count} klines...")
+                    except Exception as inner_e:
+                        self.logger.warning(f"[HIST] Parse/store error {symbol} idx={idx}: {inner_e}")
+
+                # Verify Redis list population
+                list_key = f"klines:{symbol}"
+                try:
+                    redis_len = self.redis_manager.redis_client.llen(list_key)
+                except Exception as rl_err:
+                    redis_len = -1
+                    self.logger.error(f"[HIST] Could not read Redis length for {list_key}: {rl_err}")
+
+                span_min = ((last_ts - first_ts) / 60000.0) if (first_ts and last_ts) else 0
+                self.logger.info(
+                    f"[HIST] Loaded {len(self.kline_data[symbol])}/{count} klines for {symbol} "
+                    f"(redis_len={redis_len}, span_min≈{span_min:.1f}, first_ts={first_ts}, last_ts={last_ts}, "
+                    f"elapsed={time.time() - sym_start:.2f}s)"
+                )
+                self.last_kline_fetch[symbol] = time.time()
+                total_loaded += len(self.kline_data[symbol])
+
+            except Exception as e:
+                self.logger.error(f"[HIST] Error fetching historical data for {symbol}: {e}")
+
+        self.logger.info(
+            f"[HIST] Historical backfill complete symbols={len(self.symbols)} total_klines={total_loaded} "
+            f"duration={time.time() - started_at:.2f}s"
+        )
 
     # ---------------- Main Loop ---------------- #
 

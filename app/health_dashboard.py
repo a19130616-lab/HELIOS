@@ -40,6 +40,8 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 self._serve_prices_api()
             elif parsed_path.path == '/api/decisions':
                 self._serve_decisions_api(parsed_path)
+            elif parsed_path.path == '/api/candles':
+                self._serve_candles_api(parsed_path)
             else:
                 self._serve_404()
 
@@ -137,6 +139,33 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             logging.error(f"Error serving decisions API: {e}")
+            self._serve_500()
+
+    def _serve_candles_api(self, parsed_path):
+        """Serve candlestick OHLC data with historical prices."""
+        try:
+            # Parse query params
+            qs = parse_qs(parsed_path.query)
+            symbol = qs.get('symbol', [''])[0].upper()
+            try:
+                interval_minutes = int(qs.get('interval', ['5'])[0])
+                limit = int(qs.get('limit', ['100'])[0])
+            except ValueError:
+                interval_minutes = 5
+                limit = 100
+            limit = max(1, min(limit, 500))
+            interval_minutes = max(1, min(interval_minutes, 60))
+
+            candles_data = self._get_candles_data(symbol, interval_minutes, limit)
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(candles_data, indent=2).encode())
+
+        except Exception as e:
+            logging.error(f"Error serving candles API: {e}")
             self._serve_500()
 
     def _serve_404(self):
@@ -251,7 +280,12 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                         'max_drawdown_pct': sim_summary.get('max_drawdown_pct', 0.0),
                         'simulated': True,
                         'source': 'simulated_pnl_summary',
-                        'updated_ts': sim_summary.get('updated_ts')
+                        'updated_ts': sim_summary.get('updated_ts'),
+                        # Include futures trading parameters
+                        'futures_mode': sim_summary.get('futures_mode', False),
+                        'leverage': sim_summary.get('leverage', 1.0),
+                        'daily_pnl': sim_summary.get('daily_pnl', 0.0),
+                        'daily_loss_limit': sim_summary.get('daily_loss_limit', 0.0)
                     }
                     # No real trades list in simulated fallback
                     recent_trades = []
@@ -313,6 +347,23 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             performance['total_equity_pnl'] = realized + unrealized_total
             performance['open_positions_count'] = len(enriched_positions)
             performance['open_positions'] = enriched_positions
+            # Derive simulated account value from starting balance (config) + equity PnL
+            try:
+                starting_balance = float(get_config().get('simulation', 'starting_balance', fallback='10000'))
+            except Exception:
+                starting_balance = 10000.0
+            performance['starting_balance'] = starting_balance
+            performance['account_value'] = starting_balance + performance.get('total_equity_pnl', 0.0)
+            
+            # Ensure futures parameters are included even if not in sim_summary
+            if 'futures_mode' not in performance:
+                # Try to get from simulated_pnl_summary if not already present
+                sim_summary = self.redis_manager.get_data('simulated_pnl_summary')
+                if sim_summary:
+                    performance['futures_mode'] = sim_summary.get('futures_mode', False)
+                    performance['leverage'] = sim_summary.get('leverage', 1.0)
+                    performance['daily_pnl'] = sim_summary.get('daily_pnl', 0.0)
+                    performance['daily_loss_limit'] = sim_summary.get('daily_loss_limit', 0.0)
 
             return {
                 'timestamp': get_timestamp(),
@@ -473,6 +524,252 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 'decisions': [],
                 'error': str(e)
             }
+
+    def _get_candles_data(self, symbol: str, interval_minutes: int, limit: int) -> Dict[str, Any]:
+        """Get OHLC candle data for a symbol.
+        
+        This implementation:
+        1. Fetches historical tick data from Redis (trade:{SYMBOL}_history)
+        2. If no history, fetches from Binance public API for initial seed
+        3. Aggregates ticks into OHLC candles based on interval
+        4. Caches result in Redis for performance
+        
+        Args:
+            symbol: Trading symbol (e.g., 'BTCUSDT')
+            interval_minutes: Candle interval in minutes
+            limit: Maximum number of candles to return
+            
+        Returns:
+            Dict with candles array and metadata
+        """
+        try:
+            if not self.redis_manager or not symbol:
+                return {
+                    'symbol': symbol,
+                    'interval_minutes': interval_minutes,
+                    'candles': [],
+                    'error': 'Invalid parameters'
+                }
+
+            now = get_timestamp()
+            cache_key = f"candles:{symbol}:{interval_minutes}"
+            
+            # Try to get cached candles first
+            cached = self.redis_manager.get_data(cache_key)
+            if cached and cached.get('timestamp', 0) > now - 60000:  # 1 minute cache
+                return cached
+
+            # Get historical prices from multiple sources
+            prices = []
+            
+            # 1. Try to get recent tick history from Redis
+            history_key = f"price_history:{symbol}"
+            tick_history = self.redis_manager.get_data(history_key) or []
+            
+            # 1b. If no tick history, reconstruct from stored 1m klines (PublicPriceIngestor)
+            if not tick_history:
+                try:
+                    kline_raw_list = self.redis_manager.redis_client.lrange(f"klines:{symbol}", 0, 199)
+                    if kline_raw_list:
+                        reconstructed = []
+                        # lpush stores newest first; reverse to chronological
+                        for raw in reversed(kline_raw_list):
+                            try:
+                                k = json.loads(raw)
+                                ts_val = int(k.get("timestamp") or k.get("ts") or 0)
+                                close_val = float(k.get("close") or k.get("price") or 0)
+                                reconstructed.append({
+                                    'ts': ts_val,
+                                    'price': close_val,
+                                    'open': float(k.get('open', close_val)),
+                                    'high': float(k.get('high', close_val)),
+                                    'low': float(k.get('low', close_val)),
+                                    'volume': float(k.get('volume', 0.0))
+                                })
+                            except Exception:
+                                continue
+                        if reconstructed:
+                            tick_history = reconstructed
+                            # Cache into price_history for quicker subsequent access
+                            self.redis_manager.set_data(history_key, tick_history, expiry=3600)
+                except Exception:
+                    pass
+            
+            # 2. Get current price
+            current_price = None
+            trade_data = self.redis_manager.get_data(f"trade:{symbol}")
+            if trade_data and 'price' in trade_data:
+                current_price = float(trade_data['price'])
+                current_ts = trade_data.get('timestamp', now)
+                tick_history.append({'ts': current_ts, 'price': current_price})
+            
+            # 3. If we don't have enough history, fetch from Binance public API
+            if len(tick_history) < 20:
+                historical = self._fetch_binance_klines(symbol, interval_minutes, limit)
+                if historical:
+                    tick_history = historical + tick_history
+            
+            # 4. Store tick history for future use (rolling window of 1000 points)
+            if tick_history:
+                tick_history = tick_history[-1000:]  # Keep last 1000 ticks
+                self.redis_manager.set_data(history_key, tick_history, expiry=3600)  # 1 hour TTL
+            
+            # 5. Aggregate ticks into OHLC candles
+            candles = self._aggregate_to_candles(tick_history, interval_minutes, limit)
+            
+            result = {
+                'symbol': symbol,
+                'interval_minutes': interval_minutes,
+                'candles': candles,
+                'timestamp': now
+            }
+            
+            # Cache the result
+            if candles:
+                self.redis_manager.set_data(cache_key, result, expiry=60)  # 1 minute cache
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Error getting candles data: {e}")
+            return {
+                'symbol': symbol,
+                'interval_minutes': interval_minutes,
+                'candles': [],
+                'error': str(e)
+            }
+
+    def _fetch_binance_klines(self, symbol: str, interval_minutes: int, limit: int) -> list:
+        """Fetch historical kline data from Binance public API.
+        
+        Args:
+            symbol: Trading pair symbol
+            interval_minutes: Interval in minutes
+            limit: Number of klines to fetch
+            
+        Returns:
+            List of price ticks [{ts, price}, ...]
+        """
+        try:
+            import requests
+            
+            # Map interval to Binance format
+            interval_map = {
+                1: '1m', 3: '3m', 5: '5m', 15: '15m',
+                30: '30m', 60: '1h'
+            }
+            interval = interval_map.get(interval_minutes, '5m')
+            
+            url = f"https://api.binance.com/api/v3/klines"
+            params = {
+                'symbol': symbol,
+                'interval': interval,
+                'limit': min(limit, 100)  # Binance limit
+            }
+            
+            response = requests.get(url, params=params, timeout=5)
+            if response.status_code == 200:
+                klines = response.json()
+                # Convert to our format using close price
+                ticks = []
+                for kline in klines:
+                    # Kline format: [open_time, open, high, low, close, volume, ...]
+                    ticks.append({
+                        'ts': int(kline[0]),  # open time
+                        'price': float(kline[4]),  # close price
+                        'open': float(kline[1]),
+                        'high': float(kline[2]),
+                        'low': float(kline[3]),
+                        'volume': float(kline[5])
+                    })
+                return ticks
+            else:
+                logging.warning(f"Failed to fetch Binance klines: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logging.error(f"Error fetching Binance klines: {e}")
+            return []
+
+    def _aggregate_to_candles(self, ticks: list, interval_minutes: int, limit: int) -> list:
+        """Aggregate tick data into OHLC candles.
+        
+        Args:
+            ticks: List of price ticks [{ts, price}, ...]
+            interval_minutes: Candle interval in minutes
+            limit: Maximum number of candles
+            
+        Returns:
+            List of OHLC candles
+        """
+        try:
+            if not ticks:
+                return []
+            
+            # Sort ticks by timestamp
+            sorted_ticks = sorted(ticks, key=lambda x: x['ts'])
+            interval_ms = interval_minutes * 60 * 1000
+            
+            candles = []
+            current_candle = None
+            
+            for tick in sorted_ticks:
+                ts = tick['ts']
+                price = float(tick.get('price', 0))
+                
+                # Check if this is from Binance klines (has OHLC already)
+                if 'open' in tick and 'high' in tick and 'low' in tick:
+                    # Use precomputed OHLC
+                    candle_ts = (ts // interval_ms) * interval_ms
+                    if not current_candle or current_candle['ts'] != candle_ts:
+                        if current_candle:
+                            candles.append(current_candle)
+                        current_candle = {
+                            'ts': candle_ts,
+                            'open': float(tick['open']),
+                            'high': float(tick['high']),
+                            'low': float(tick['low']),
+                            'close': price,
+                            'volume': float(tick.get('volume', 0))
+                        }
+                    else:
+                        # Merge with existing candle (shouldn't happen with klines)
+                        current_candle['high'] = max(current_candle['high'], float(tick['high']))
+                        current_candle['low'] = min(current_candle['low'], float(tick['low']))
+                        current_candle['close'] = price
+                        current_candle['volume'] += float(tick.get('volume', 0))
+                else:
+                    # Regular tick data - aggregate into candles
+                    candle_ts = (ts // interval_ms) * interval_ms
+                    
+                    if not current_candle or current_candle['ts'] != candle_ts:
+                        # Start new candle
+                        if current_candle:
+                            candles.append(current_candle)
+                        current_candle = {
+                            'ts': candle_ts,
+                            'open': price,
+                            'high': price,
+                            'low': price,
+                            'close': price,
+                            'volume': 0
+                        }
+                    else:
+                        # Update current candle
+                        current_candle['high'] = max(current_candle['high'], price)
+                        current_candle['low'] = min(current_candle['low'], price)
+                        current_candle['close'] = price
+            
+            # Don't forget the last candle
+            if current_candle:
+                candles.append(current_candle)
+            
+            # Return only the requested number of most recent candles
+            return candles[-limit:] if candles else []
+            
+        except Exception as e:
+            logging.error(f"Error aggregating candles: {e}")
+            return []
     
     def _generate_dashboard_html(self) -> str:
         """Generate the dashboard HTML."""
@@ -635,6 +932,44 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
         .conf-high { color: #58a6ff; }
         .conf-med { color: #c9d1d9; }
         .conf-low { color: #8b949e; }
+        .decisions-card { grid-column: span 2; }
+        .candle-canvas { background:#161b22; border:1px solid #30363d; border-radius:4px; }
+        
+        /* Trend boxes styling */
+        #trendBoxes {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin-bottom: 40px;
+        }
+        .trend-box {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 12px 16px 16px 16px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.25);
+            width: 100%;
+        }
+        .trend-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+            font-size: 0.9em;
+            color: #c9d1d9;
+        }
+        .trend-header .symbol {
+            font-weight: 600;
+            font-size: 1.05em;
+            color: #f0f6fc;
+        }
+        .trend-canvas {
+            width: 100%;
+            height: 150px;
+            background: #0d1117;
+            border: 1px solid #21262d;
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body>
@@ -645,6 +980,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             <div class="auto-refresh">
                 <button class="refresh-btn" onclick="refreshAll()">🔄 Refresh All</button>
                 <button class="refresh-btn" onclick="toggleAutoRefresh()" id="autoRefreshBtn">▶️ Auto Refresh</button>
+                <button class="refresh-btn" onclick="resetTrends()">♻️ Reset Trends</button>
                 <span id="lastUpdate"></span>
             </div>
         </div>
@@ -675,11 +1011,13 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 <div id="recentTrades">Loading...</div>
             </div>
 
-            <div class="status-card">
+            <div class="status-card decisions-card">
                 <h3>Decisions</h3>
                 <div id="decisionsLog" class="decisions-table-wrapper">Loading...</div>
             </div>
         </div>
+        <h2 style="margin:10px 0 15px 4px; color:#58a6ff; font-size:1.3em;">Price Trends</h2>
+        <div id="trendBoxes"></div>
     </div>
 
     <script>
@@ -768,8 +1106,51 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             const realized = perf.total_pnl || 0;
             const unrealized = perf.unrealized_pnl || 0;
             const equity = perf.total_equity_pnl !== undefined ? perf.total_equity_pnl : (realized + unrealized);
+            const accountValue = perf.account_value !== undefined ? perf.account_value : ((perf.starting_balance || 10000) + equity);
+            
+            // Futures trading info
+            const futuresMode = perf.futures_mode || false;
+            const leverage = perf.leverage || 1.0;
+            const dailyPnL = perf.daily_pnl || 0;
+            const dailyLimit = perf.daily_loss_limit || 0;
 
-            element.innerHTML = `
+            let html = '';
+            
+            // Show futures badge if enabled
+            if (futuresMode) {
+                html += `
+                    <div class="metric-row" style="background:#1f6feb20; padding:6px; border-radius:4px; margin-bottom:8px;">
+                        <span class="metric-label" style="color:#58a6ff;">⚡ FUTURES MODE</span>
+                        <span class="metric-value" style="color:#58a6ff;">${leverage}x Leverage</span>
+                    </div>
+                `;
+            }
+            
+            html += `
+                <div class="metric-row">
+                    <span class="metric-label">Account Value:</span>
+                    <span class="metric-value ${accountValue >= perf.starting_balance ? 'profit' : 'loss'}">$${accountValue.toFixed(2)}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Today's PnL:</span>
+                    <span class="metric-value ${dailyPnL >= 0 ? 'profit' : 'loss'}">$${dailyPnL.toFixed(2)}</span>
+                </div>
+            `;
+            
+            // Show daily limit warning if close
+            if (futuresMode && dailyLimit > 0 && dailyPnL < 0) {
+                const limitPct = (dailyPnL / -dailyLimit) * 100;
+                if (limitPct > 50) {
+                    html += `
+                        <div class="metric-row" style="background:#dc354520; padding:4px; border-radius:4px;">
+                            <span class="metric-label" style="color:#f85149;">⚠️ Daily Limit:</span>
+                            <span class="metric-value" style="color:#f85149;">${limitPct.toFixed(0)}% Used</span>
+                        </div>
+                    `;
+                }
+            }
+            
+            html += `
                 <div class="metric-row">
                     <span class="metric-label">Total Trades:</span>
                     <span class="metric-value">${perf.total_trades || 0}</span>
@@ -787,10 +1168,6 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     <span class="metric-value ${unrealized >= 0 ? 'profit' : 'loss'}">$${unrealized.toFixed(2)}</span>
                 </div>
                 <div class="metric-row">
-                    <span class="metric-label">Equity PnL:</span>
-                    <span class="metric-value ${equity >= 0 ? 'profit' : 'loss'}">$${equity.toFixed(2)}</span>
-                </div>
-                <div class="metric-row">
                     <span class="metric-label">Open Positions:</span>
                     <span class="metric-value">${perf.open_positions_count || 0}</span>
                 </div>
@@ -799,6 +1176,8 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     <span class="metric-value">${perf.max_drawdown_pct ? perf.max_drawdown_pct.toFixed(2) + '%' : '0%'}</span>
                 </div>
             `;
+            
+            element.innerHTML = html;
         }
 
         async function updateRecentTrades() {
@@ -876,7 +1255,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 return;
             }
 
-            // Build table
+            // Build table (chart column removed)
             let html = `<table>
                 <thead>
                     <tr>
@@ -912,6 +1291,16 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
 
             html += '</tbody></table>';
             element.innerHTML = html;
+
+            // Update trend series (replace prior inline mini-candles)
+            const nowTs = data.timestamp;
+            const symbols = data.prices.map(p => p.symbol).sort();
+            buildTrendBoxes(symbols);
+            data.prices.forEach(p => {
+                const ts = nowTs - p.age_ms;
+                updateTrendSeries(p.symbol, p.price, ts);
+                drawTrend(p.symbol);
+            });
         }
 
         function classifyConfidence(conf) {
@@ -980,6 +1369,13 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
         }
 
         async function refreshAll() {
+            // Optional first-load trend reset (keeps initial historical sequence clean)
+            if (firstTrendReset) {
+                const holder = document.getElementById('trendBoxes');
+                if (holder) holder.innerHTML = '';
+                for (const k in candleData) { delete candleData[k]; }
+                firstTrendReset = false;
+            }
             await Promise.all([
                 updateSystemStatus(),
                 updateLivePrices(),
@@ -1009,8 +1405,281 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             }
         }
 
-        // Initial load
+        // --- Candlestick charts (full-width per symbol) ---
+        const candleData = {}; // symbol -> candles array from API
+        const candleInterval = 5; // 5-minute candles by default
+        let firstTrendReset = true;
+
+        function buildTrendBoxes(symbols) {
+            const holder = document.getElementById('trendBoxes');
+            if (!holder) return;
+            const existing = new Set(Array.from(holder.querySelectorAll('.trend-box')).map(e => e.dataset.symbol));
+            symbols.forEach(sym => {
+                if (!existing.has(sym)) {
+                    const div = document.createElement('div');
+                    div.className = 'trend-box';
+                    div.dataset.symbol = sym;
+                    div.innerHTML = `
+                        <div class="trend-header">
+                            <span class="symbol">${sym}</span>
+                            <span id="lastPrice-${sym}" class="price">-</span>
+                        </div>
+                        <canvas id="trend-${sym}" class="trend-canvas"></canvas>
+                    `;
+                    holder.appendChild(div);
+                    // Fetch initial candle data
+                    fetchCandles(sym);
+                }
+            });
+        }
+
+        function resetTrends() {
+            const holder = document.getElementById('trendBoxes');
+            if (holder) holder.innerHTML = '';
+            for (const k in candleData) { delete candleData[k]; }
+            firstTrendReset = false;
+            // Re-fetch and rebuild via live prices
+            updateLivePrices();
+        }
+
+        async function fetchCandles(symbol) {
+            try {
+                const response = await fetch(`/api/candles?symbol=${symbol}&interval=${candleInterval}&limit=50`);
+                const data = await response.json();
+                if (data.candles && data.candles.length > 0) {
+                    candleData[symbol] = data.candles;
+                    drawCandlestickChart(symbol);
+                }
+            } catch (error) {
+                console.error(`Error fetching candles for ${symbol}:`, error);
+            }
+        }
+
+        function updateTrendSeries(symbol, price, ts) {
+            // Update the last price display
+            const lp = document.getElementById(`lastPrice-${symbol}`);
+            if (lp) lp.textContent = formatPrice(Number(price));
+            
+            // Update the latest candle or create a new one
+            if (!candleData[symbol]) {
+                // If no candle data yet, fetch it
+                fetchCandles(symbol);
+                return;
+            }
+            
+            const intervalMs = candleInterval * 60 * 1000;
+            const candleTs = Math.floor(ts / intervalMs) * intervalMs;
+            const candles = candleData[symbol];
+            
+            if (candles.length > 0) {
+                const lastCandle = candles[candles.length - 1];
+                if (lastCandle.ts === candleTs) {
+                    // Update existing candle
+                    lastCandle.high = Math.max(lastCandle.high, price);
+                    lastCandle.low = Math.min(lastCandle.low, price);
+                    lastCandle.close = price;
+                } else {
+                    // Start new candle
+                    candles.push({
+                        ts: candleTs,
+                        open: price,
+                        high: price,
+                        low: price,
+                        close: price,
+                        volume: 0
+                    });
+                    // Keep only last 50 candles
+                    if (candles.length > 50) {
+                        candles.shift();
+                    }
+                }
+                drawCandlestickChart(symbol);
+            }
+        }
+
+        function drawTrend(symbol) {
+            // This is now called drawCandlestickChart
+            drawCandlestickChart(symbol);
+        }
+
+        function drawCandlestickChart(symbol) {
+            const candles = candleData[symbol];
+            if (!candles || candles.length === 0) return;
+            
+            const canvas = document.getElementById(`trend-${symbol}`);
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width * window.devicePixelRatio;
+            canvas.height = rect.height * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            ctx.clearRect(0, 0, rect.width, rect.height);
+
+            const w = rect.width;
+            const h = rect.height;
+            const leftPadding = 65; // More space for Y-axis labels
+            const rightPadding = 20;
+            const topPadding = 20;
+            const bottomPadding = 30; // More space for X-axis labels
+            const chartW = w - leftPadding - rightPadding;
+            const chartH = h - topPadding - bottomPadding;
+
+            // Find min/max prices
+            let minPrice = Infinity;
+            let maxPrice = -Infinity;
+            candles.forEach(c => {
+                minPrice = Math.min(minPrice, c.low);
+                maxPrice = Math.max(maxPrice, c.high);
+            });
+            // Add 1% padding to price range
+            const priceMargin = (maxPrice - minPrice) * 0.01 || minPrice * 0.001;
+            minPrice -= priceMargin;
+            maxPrice += priceMargin;
+            const priceRange = maxPrice - minPrice || 1;
+
+            // Calculate candle width
+            const candleWidth = Math.max(1, (chartW / candles.length) * 0.8);
+            const candleSpacing = chartW / candles.length;
+
+            // Draw background
+            ctx.fillStyle = '#0d1117';
+            ctx.fillRect(leftPadding, topPadding, chartW, chartH);
+
+            // Draw grid lines and Y-axis labels
+            ctx.strokeStyle = '#21262d';
+            ctx.lineWidth = 0.5;
+            ctx.setLineDash([2, 2]);
+            ctx.font = '11px monospace';
+            ctx.fillStyle = '#8b949e';
+            
+            const gridLines = 5;
+            for (let i = 0; i <= gridLines; i++) {
+                const y = topPadding + (i / gridLines) * chartH;
+                const price = maxPrice - (i / gridLines) * priceRange;
+                
+                // Grid line
+                ctx.beginPath();
+                ctx.moveTo(leftPadding, y);
+                ctx.lineTo(w - rightPadding, y);
+                ctx.stroke();
+                
+                // Y-axis label
+                ctx.fillText(formatPrice(price), 5, y + 3);
+            }
+            
+            // Highlight highest and lowest prices
+            ctx.font = 'bold 11px monospace';
+            ctx.fillStyle = '#58a6ff';
+            ctx.fillText('H: ' + formatPrice(maxPrice - priceMargin), 5, topPadding - 5);
+            ctx.fillStyle = '#f85149';
+            ctx.fillText('L: ' + formatPrice(minPrice + priceMargin), 5, h - bottomPadding + 15);
+            
+            ctx.setLineDash([]);
+
+            // Draw X-axis time labels
+            ctx.font = '10px monospace';
+            ctx.fillStyle = '#8b949e';
+            const timeLabels = Math.min(6, candles.length); // Show max 6 time labels
+            const labelInterval = Math.max(1, Math.floor(candles.length / timeLabels));
+            
+            for (let i = 0; i < candles.length; i += labelInterval) {
+                const candle = candles[i];
+                const x = leftPadding + i * candleSpacing + candleSpacing / 2;
+                const date = new Date(candle.ts);
+                const timeStr = date.getHours().toString().padStart(2, '0') + ':' +
+                               date.getMinutes().toString().padStart(2, '0');
+                
+                ctx.save();
+                ctx.translate(x, h - 5);
+                ctx.rotate(-Math.PI / 4); // Rotate 45 degrees
+                ctx.fillText(timeStr, 0, 0);
+                ctx.restore();
+            }
+
+            // Draw candles
+            candles.forEach((candle, i) => {
+                const x = leftPadding + i * candleSpacing + candleSpacing / 2;
+                const openY = topPadding + (1 - (candle.open - minPrice) / priceRange) * chartH;
+                const closeY = topPadding + (1 - (candle.close - minPrice) / priceRange) * chartH;
+                const highY = topPadding + (1 - (candle.high - minPrice) / priceRange) * chartH;
+                const lowY = topPadding + (1 - (candle.low - minPrice) / priceRange) * chartH;
+
+                const isGreen = candle.close >= candle.open;
+                const color = isGreen ? '#2ea043' : '#f85149';
+
+                // Draw wick (high-low line)
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(x, highY);
+                ctx.lineTo(x, lowY);
+                ctx.stroke();
+
+                // Draw body
+                ctx.fillStyle = color;
+                ctx.globalAlpha = isGreen ? 0.8 : 1.0;
+                const bodyTop = Math.min(openY, closeY);
+                const bodyHeight = Math.abs(openY - closeY) || 1;
+                ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+                ctx.globalAlpha = 1.0;
+
+                // Draw body outline
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+            });
+
+            // Draw current price line
+            const lastCandle = candles[candles.length - 1];
+            const currentY = topPadding + (1 - (lastCandle.close - minPrice) / priceRange) * chartH;
+            ctx.strokeStyle = '#58a6ff';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 2]);
+            ctx.beginPath();
+            ctx.moveTo(leftPadding, currentY);
+            ctx.lineTo(w - rightPadding, currentY);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Draw current price label with background
+            const priceText = formatPrice(lastCandle.close);
+            ctx.font = 'bold 11px monospace';
+            const textWidth = ctx.measureText(priceText).width;
+            
+            // Background for price label
+            ctx.fillStyle = '#58a6ff';
+            ctx.fillRect(w - rightPadding - textWidth - 10, currentY - 8, textWidth + 8, 16);
+            
+            // Price text
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(priceText, w - rightPadding - textWidth - 6, currentY + 3);
+            
+            // Draw chart title with last update time
+            const lastDate = new Date(candles[candles.length - 1].ts);
+            const updateStr = 'Last: ' + lastDate.toLocaleTimeString();
+            ctx.font = '10px sans-serif';
+            ctx.fillStyle = '#8b949e';
+            ctx.fillText(updateStr, leftPadding, 12);
+        }
+
+        // Periodic candle refetch (every 60s) to ensure alignment with backend state
+        // Covers: missed updates, browser throttling (background tabs), backend restarts repopulating Redis
+        let candleRefetchTimer = null;
+        function startCandleRefetch() {
+            if (candleRefetchTimer) return;
+            candleRefetchTimer = setInterval(() => {
+                const symbols = Object.keys(candleData);
+                if (!symbols || symbols.length === 0) return;
+                symbols.forEach(sym => {
+                    fetchCandles(sym); // Re-fetch authoritative 5m aggregation (limit=50)
+                });
+            }, 60000);
+        }
+
+        // Initial load + start periodic refetch
         refreshAll();
+        startCandleRefetch();
     </script>
 </body>
 </html>
