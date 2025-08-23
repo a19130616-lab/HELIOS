@@ -19,6 +19,7 @@ from binance.um_futures import UMFutures
 from app.config_manager import init_config, get_config
 from app.utils import RedisManager, setup_logging
 from app.data_ingestor import DataIngestor
+from app.public_price_ingestor import PublicPriceIngestor
 from app.signal_engine import SignalEngine
 from app.risk_manager import RiskManager
 from app.execution_manager import ExecutionManager
@@ -26,6 +27,7 @@ from app.monitoring_agent import MonitoringAgent
 from app.reddit_ingestor import RedditIngestor
 from app.performance_tracker import PerformanceTracker
 from app.health_dashboard import HealthDashboard
+from app.decision_logger import DecisionLogger
 
 class HeliosSystem:
     """
@@ -44,13 +46,18 @@ class HeliosSystem:
         self.redis_manager = None
         self.api_client = None
         self.data_ingestor = None
+        self.public_price_ingestor = None
         self.signal_engine = None
         self.risk_manager = None
         self.execution_manager = None
         self.reddit_ingestor = None
         self.monitoring_agent = None
         self.performance_tracker = None
+        self.decision_logger = None
         self.health_dashboard = None
+        
+        # Resolved operational mode: 'live' | 'public' | 'synthetic'
+        self.operational_mode: Optional[str] = None
         
         # Watchlist management
         self.watchlist = []
@@ -118,125 +125,195 @@ class HeliosSystem:
             raise
     
     def _initialize_api_client(self) -> None:
-        """Initialize Binance API client."""
+        """Initialize Binance API client.
+
+        Hardened logic:
+        - Case-insensitive / pattern-based placeholder detection
+        - No legacy demo auto-fallback; missing/invalid credentials -> public or synthetic (if enabled) else abort
+        - Explicit operational modes: live | public | synthetic (ALLOW_PUBLIC_MODE / ALLOW_SYNTHETIC gates)
+        - DEMO_MODE env var deprecated and ignored (warning emitted)
+        """
         try:
             api_key = self.config.get('binance', 'api_key', str)
             api_secret = self.config.get('binance', 'api_secret', str)
             testnet = self.config.get('binance', 'testnet', bool)
+
+            # Environment overrides (prefer env over config for secrets)
+            env_api_key = os.getenv('BINANCE_API_KEY')
+            env_api_secret = os.getenv('BINANCE_API_SECRET')
+            env_testnet = os.getenv('BINANCE_TESTNET')
+
+            if env_api_key:
+                api_key = env_api_key.strip()
+                self.logger.info("Using BINANCE_API_KEY from environment (config file value overridden)")
+            if env_api_secret:
+                api_secret = env_api_secret.strip()
+                self.logger.info("Using BINANCE_API_SECRET from environment (config file value overridden)")
+            if env_testnet:
+                testnet = str(env_testnet).lower() in ("1", "true", "yes", "on")
+                self.logger.info(f"BINANCE_TESTNET override detected -> testnet={testnet}")
+
+            # DEMO_MODE env is deprecated; ignore but note
+            if os.getenv('DEMO_MODE'):
+                self.logger.warning("DEMO_MODE env variable is deprecated; system uses live/testnet or public/synthetic modes")
             
-            # Check for demo mode environment variable
-            demo_mode = os.getenv('DEMO_MODE', 'false').lower() == 'true'
-            
-            if demo_mode:
-                self.logger.warning("🔸 DEMO MODE ENABLED - Using simulated data, no real API connection")
-                self.api_client = None  # Will be handled by data_ingestor in demo mode
-                return
-            
-            if api_key == "YOUR_API_KEY_HERE" or api_secret == "YOUR_API_SECRET_HERE":
-                self.logger.warning("⚠️ Invalid API keys detected - Switching to DEMO MODE")
-                self.api_client = None
-                return
-            
+            def is_placeholder(value: Optional[str]) -> bool:
+                if not value:
+                    return True
+                v = value.strip().lower()
+                # Detect generic placeholder patterns or obviously invalid short strings
+                if v in {"your_api_key_here", "your_api_secret_here"}:
+                    return True
+                if "your_" in v and ("api_key" in v or "api_secret" in v):
+                    return True
+                if len(v) < 10:  # Binance keys are longer; very short means invalid
+                    return True
+                return False
+
+            key_placeholder = is_placeholder(api_key)
+            secret_placeholder = is_placeholder(api_secret)
+
+            allow_public = os.getenv("ALLOW_PUBLIC_MODE", "true").lower() in ("1", "true", "yes", "on")
+            allow_synthetic = os.getenv("ALLOW_SYNTHETIC", "false").lower() in ("1", "true", "yes", "on")
+
+            if key_placeholder or secret_placeholder:
+                if allow_public:
+                    self.logger.warning(
+                        "No valid Binance API credentials provided. Entering PUBLIC (read-only) mode "
+                        "- trading disabled; using unauthenticated REST polling."
+                    )
+                    self.api_client = None
+                    self.operational_mode = 'public'
+                    return
+                if allow_synthetic:
+                    self.logger.warning(
+                        "No valid Binance API credentials and ALLOW_PUBLIC_MODE disabled but ALLOW_SYNTHETIC enabled. "
+                        "Entering SYNTHETIC (simulated) mode - trading disabled."
+                    )
+                    self.api_client = None
+                    self.operational_mode = 'synthetic'
+                    return
+                raise RuntimeError(
+                    "Invalid / placeholder Binance API credentials detected and both ALLOW_PUBLIC_MODE & ALLOW_SYNTHETIC disabled. "
+                    "Provide valid TESTNET keys or enable one of the modes (ALLOW_PUBLIC_MODE or ALLOW_SYNTHETIC)."
+                )
+
             if testnet:
                 base_url = "https://testnet.binancefuture.com"
                 self.logger.info("Using Binance TESTNET - No real money at risk")
             else:
                 base_url = "https://fapi.binance.com"
                 self.logger.warning("Using Binance MAINNET - Real money trading enabled")
-            
+
             self.api_client = UMFutures(
                 key=api_key,
                 secret=api_secret,
                 base_url=base_url
             )
-            
-            # Test API connection
+
+            # Test API connection (fail hard if not authenticated)
             try:
                 account_info = self.api_client.account()
-                balance = float(account_info['totalWalletBalance'])
-                self.logger.info(f"Binance API connection established - Balance: ${balance:.2f}")
+                balance = float(account_info.get('totalWalletBalance', 0.0))
+                self.logger.info(f"Binance API connection established - Wallet Balance: ${balance:.2f}")
+                self.operational_mode = 'live'
             except Exception as api_error:
-                self.logger.warning(f"API validation failed: {api_error}")
-                self.logger.warning("🔸 Switching to DEMO MODE - Using simulated data")
-                self.api_client = None
-            
+                # Log detailed error and abort
+                self.logger.error(f"Binance API validation failed: {api_error}")
+                raise RuntimeError("Binance API validation failed; aborting startup (no simulated fallback).") from api_error
+
         except Exception as e:
-            self.logger.error(f"Failed to initialize Binance API: {e}")
-            self.logger.warning("🔸 Falling back to DEMO MODE")
-            self.api_client = None
+            # Fail hard: propagate after logging; do NOT set api_client to None (prevents simulated data usage)
+            if self.logger:
+                self.logger.error(f"Failed to initialize Binance API (hard fail): {e}")
+            raise
     
     def _initialize_watchlist(self) -> None:
         """Initialize trading symbol watchlist."""
         try:
-            # Start with popular crypto pairs
+            default_watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSUT']  # note: SOLUSUT typo kept intentionally? correcting below
+            # Correct any typos
             default_watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
-            
+
             if self.api_client is None:
-                # Demo mode - use default watchlist
+                # Public mode - we may later enhance to fetch top volume via public endpoint
                 self.watchlist = default_watchlist
-                self.logger.info(f"🔸 Demo mode watchlist: {self.watchlist}")
+                self.logger.info(f"Public mode watchlist: {self.watchlist}")
             else:
-                # Validate symbols with exchange
                 exchange_info = self.api_client.exchange_info()
                 available_symbols = [s['symbol'] for s in exchange_info['symbols'] if s['status'] == 'TRADING']
-                
-                # Filter to only available symbols
                 self.watchlist = [symbol for symbol in default_watchlist if symbol in available_symbols]
-                
                 if not self.watchlist:
                     raise ValueError("No valid trading symbols found")
-                
                 self.logger.info(f"Initialized watchlist: {self.watchlist}")
-            
+
         except Exception as e:
             self.logger.error(f"Failed to initialize watchlist: {e}")
-            # Fallback to default watchlist in case of error
             self.watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
             self.logger.warning(f"Using fallback watchlist: {self.watchlist}")
     
     def _initialize_components(self) -> None:
         """Initialize all system components."""
         try:
-            # Initialize Risk Manager first (needed by Execution Manager)
+            # Risk manager (even in public mode for future evaluation logic, but may be limited)
             self.logger.info("Initializing Risk Manager...")
             self.risk_manager = RiskManager(self.api_client)
-            
-            # Initialize Data Ingestor
-            self.logger.info("Initializing Data Ingestor...")
-            self.data_ingestor = DataIngestor(self.watchlist, self.redis_manager, self.api_client)
-            
-            # Initialize Signal Engine
+
+            # Ingestion: choose based on resolved operational mode
+            if self.operational_mode == 'live':
+                self.logger.info("Initializing Data Ingestor (websocket live)...")
+                self.data_ingestor = DataIngestor(self.watchlist, self.redis_manager, self.api_client, synthetic_mode=False)
+            elif self.operational_mode == 'public':
+                self.logger.info("Initializing Public Price Ingestor (public mode)...")
+                self.public_price_ingestor = PublicPriceIngestor(self.watchlist, self.redis_manager)
+            elif self.operational_mode == 'synthetic':
+                self.logger.info("Initializing Data Ingestor (synthetic simulated mode)...")
+                self.data_ingestor = DataIngestor(self.watchlist, self.redis_manager, api_client=None, synthetic_mode=True)
+            else:
+                raise RuntimeError(f"Unknown operational mode: {self.operational_mode}")
+
+            # Signal Engine
             self.logger.info("Initializing Signal Engine...")
             self.signal_engine = SignalEngine(self.redis_manager, self.watchlist)
             
-            # Initialize Reddit Ingestor
+            # Reddit Ingestor
             self.logger.info("Initializing Reddit Ingestor...")
             self.reddit_ingestor = RedditIngestor(self.redis_manager)
             
-            # Initialize Performance Tracker
+            # Performance Tracker
             self.logger.info("Initializing Performance Tracker...")
             self.performance_tracker = PerformanceTracker(self.redis_manager)
-            
-            # Initialize Execution Manager
-            self.logger.info("Initializing Execution Manager...")
-            self.execution_manager = ExecutionManager(
-                self.api_client,
-                self.risk_manager,
-                self.redis_manager
+
+            # Decision Logger (captures trading_signals -> decision_logs)
+            self.logger.info("Initializing Decision Logger...")
+            self.decision_logger = DecisionLogger(
+                self.redis_manager,
+                mode_resolver=lambda: (self.operational_mode or ("live" if self.api_client else ("public" if self.public_price_ingestor else "synthetic")))
             )
-            
-            # Initialize Monitoring Agent
+
+            # Execution Manager only if trading possible
+            if self.operational_mode == 'live' and self.api_client:
+                self.logger.info("Initializing Execution Manager...")
+                self.execution_manager = ExecutionManager(
+                    self.api_client,
+                    self.risk_manager,
+                    self.redis_manager
+                )
+            else:
+                self.logger.info(f"Skipping Execution Manager initialization ({self.operational_mode} mode - trading disabled)")
+
+            # Monitoring Agent
             self.logger.info("Initializing Monitoring Agent...")
             self.monitoring_agent = MonitoringAgent(
-                self.data_ingestor,
+                self.data_ingestor if self.data_ingestor else self.public_price_ingestor,
                 self.signal_engine,
                 self.risk_manager,
                 self.execution_manager,
                 self.reddit_ingestor,
                 self.performance_tracker
             )
-            
-            # Initialize Health Dashboard
+
+            # Health Dashboard
             self.logger.info("Initializing Health Dashboard...")
             dashboard_port = self.config.get('system', 'dashboard_port', int, 8080)
             self.health_dashboard = HealthDashboard(
@@ -244,9 +321,9 @@ class HeliosSystem:
                 system_reference=self,
                 port=dashboard_port
             )
-            
+
             self.logger.info("All components initialized")
-            
+
         except Exception as e:
             self.logger.error(f"Failed to initialize components: {e}")
             raise
@@ -265,11 +342,17 @@ class HeliosSystem:
             
             # Start components in order
             self.risk_manager.start()
-            self.data_ingestor.start()
+            if self.data_ingestor:
+                self.data_ingestor.start()
+            elif self.public_price_ingestor:
+                self.public_price_ingestor.start()
             self.reddit_ingestor.start()
             self.performance_tracker.start()
             self.signal_engine.start()
-            self.execution_manager.start()
+            if self.decision_logger:
+                self.decision_logger.start()
+            if self.execution_manager:
+                self.execution_manager.start()
             self.monitoring_agent.start()
             self.health_dashboard.start()
             
@@ -306,6 +389,7 @@ class HeliosSystem:
             ("Monitoring Agent", self.monitoring_agent),
             ("Execution Manager", self.execution_manager),
             ("Signal Engine", self.signal_engine),
+            ("Decision Logger", self.decision_logger),
             ("Performance Tracker", self.performance_tracker),
             ("Reddit Ingestor", self.reddit_ingestor),
             ("Data Ingestor", self.data_ingestor),
@@ -369,9 +453,9 @@ class HeliosSystem:
     def _update_dynamic_watchlist(self) -> None:
         """Update the watchlist based on market conditions."""
         try:
-            # Skip dynamic watchlist updates in demo mode
+            # Skip dynamic watchlist updates when no authenticated API client (public/synthetic modes)
             if self.api_client is None:
-                self.logger.debug("Demo mode: Skipping dynamic watchlist updates")
+                self.logger.debug("Public/Synthetic mode: Skipping dynamic watchlist updates")
                 return
                 
             # This is a simplified implementation
@@ -452,23 +536,46 @@ class HeliosSystem:
     def _print_startup_summary(self) -> None:
         """Print system startup summary."""
         try:
+            if self.operational_mode == 'live':
+                trading_mode = "LIVE (TESTNET)" if self.config.get('binance', 'testnet', bool) else "LIVE (MAINNET)"
+            elif self.operational_mode == 'public':
+                trading_mode = "PUBLIC (read-only)"
+            elif self.operational_mode == 'synthetic':
+                trading_mode = "SYNTHETIC (simulated)"
+            else:
+                trading_mode = "UNKNOWN"
+
+            components_total = 8  # legacy count; compute active
+            active_components = sum([
+                1 if self.risk_manager else 0,
+                1 if (self.data_ingestor or self.public_price_ingestor) else 0,
+                1 if self.signal_engine else 0,
+                1 if self.execution_manager else 0,
+                1 if self.reddit_ingestor else 0,
+                1 if self.performance_tracker else 0,
+                1 if self.monitoring_agent else 0,
+                1 if self.health_dashboard else 0
+            ])
             summary = [
                 "",
                 "🚀 HELIOS TRADING SYSTEM - OPERATIONAL 🚀",
                 "=" * 50,
+                f"Mode: {trading_mode}",
                 f"Trading Symbols: {', '.join(self.watchlist)}",
-                f"Components Running: 8/8",
-                f"Risk Management: ACTIVE",
-                f"API Mode: {'TESTNET' if self.config.get('binance', 'testnet', bool) else 'MAINNET'}",
+                f"Components Running: {active_components}/{components_total}",
+                f"Risk Management: {'ACTIVE' if self.risk_manager else 'N/A'}",
+                f"Execution: {'ENABLED' if self.execution_manager else 'DISABLED'}",
                 "=" * 50,
-                "System is now actively monitoring markets and ready to trade.",
+                ("System is monitoring markets and ready to trade." if self.execution_manager
+                 else ("System is in read-only PUBLIC mode (signals generated; orders NOT executed)." if self.operational_mode == 'public'
+                       else "System is in SYNTHETIC simulation mode (no external data; trading disabled).")),
                 "Monitor logs for trading signals and system status.",
                 ""
             ]
-            
+
             for line in summary:
                 self.logger.info(line)
-                
+
         except Exception as e:
             self.logger.error(f"Error printing startup summary: {e}")
     
@@ -485,14 +592,17 @@ class HeliosSystem:
                 'start_time': self.start_time,
                 'uptime_seconds': (time.time() * 1000 - self.start_time) / 1000 if self.start_time else 0,
                 'watchlist': self.watchlist,
+                'operational_mode': self.operational_mode,
                 'components': {}
             }
             
             # Get component status
             components = {
                 'data_ingestor': self.data_ingestor,
+                'public_price_ingestor': self.public_price_ingestor,
                 'reddit_ingestor': self.reddit_ingestor,
                 'performance_tracker': self.performance_tracker,
+                'decision_logger': self.decision_logger,
                 'signal_engine': self.signal_engine,
                 'risk_manager': self.risk_manager,
                 'execution_manager': self.execution_manager,

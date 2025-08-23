@@ -16,6 +16,8 @@ class SignalDirection(Enum):
     """Signal direction enumeration."""
     LONG = "LONG"
     SHORT = "SHORT"
+    EXIT_LONG = "EXIT_LONG"
+    EXIT_SHORT = "EXIT_SHORT"
 
 class MarketRegime(Enum):
     """Market regime classification."""
@@ -77,6 +79,52 @@ class TradingSignal:
             raise ValueError("Confidence must be between 0 and 1")
         if not -1 <= self.nobi_value <= 1:
             raise ValueError("NOBI value must be between -1 and 1")
+
+@dataclass
+class DecisionLog:
+    """
+    Represents a logged trading decision or exit event.
+    Extended to support explicit EXIT_* directions and realized PnL
+    for simulated/public modes when execution is disabled.
+    """
+    symbol: str
+    direction: SignalDirection               # LONG | SHORT | EXIT_LONG | EXIT_SHORT
+    timestamp: int
+    confidence: float
+    nobi_value: float
+    entry_price: float                       # For EXIT_* this is treated as exit_price
+    mode: str                                # 'live' | 'public' | 'synthetic'
+    reason: Optional[str] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    notes: Optional[str] = None
+    realized_pnl: Optional[float] = None     # Populated on EXIT_* events
+    position_size: Optional[float] = None    # Size used for PnL calc (simulated/public)
+
+    def __post_init__(self):
+        if not 0 <= self.confidence <= 1:
+            raise ValueError("Confidence must be between 0 and 1")
+        if not -1 <= self.nobi_value <= 1:
+            raise ValueError("NOBI value must be between -1 and 1")
+        if self.mode not in ("live", "public", "synthetic"):
+            raise ValueError("mode must be one of 'live','public','synthetic'")
+
+    def to_dict(self) -> Dict[str, Union[str, float, int, None]]:
+        return {
+            "symbol": self.symbol,
+            "direction": self.direction.value,
+            "timestamp": self.timestamp,
+            "confidence": self.confidence,
+            "nobi_value": self.nobi_value,
+            "entry_price": self.entry_price,
+            "mode": self.mode,
+            "reason": self.reason,
+            "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
+            "notes": self.notes,
+            "realized_pnl": self.realized_pnl,
+            "position_size": self.position_size,
+        }
 
 @dataclass
 class Position:

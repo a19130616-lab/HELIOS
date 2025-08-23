@@ -253,9 +253,9 @@ class RiskManager:
             Stop loss price
         """
         try:
-            # Handle demo mode when api_client is None
+            # Handle no API client (public or synthetic mode)
             if self.api_client is None:
-                # Use default 1% stop loss in demo mode
+                # Use default 1% stop loss when no API client
                 multiplier = 0.01
             else:
                 # Get recent kline data for ATR calculation
@@ -311,7 +311,7 @@ class RiskManager:
             # Get ATR-based distance
             try:
                 if self.api_client is None:
-                    # Demo mode - use fixed 1% distance
+                    # No API client (public/synthetic) - use fixed 1% distance
                     atr_distance = position.high_water_mark * 0.01
                 else:
                     klines = self.api_client.klines(symbol=position.symbol, interval="1m", limit=20)
@@ -490,7 +490,7 @@ class RiskManager:
         """Manage trailing stops for all positions."""
         while self.is_running:
             try:
-                # Skip if no API client (demo mode)
+                # Skip if no API client (public/synthetic)
                 if self.api_client is None:
                     time.sleep(5)
                     continue
@@ -511,11 +511,11 @@ class RiskManager:
     def _get_account_info(self) -> Optional[AccountInfo]:
         """Get current account information."""
         try:
-            # Handle demo mode when api_client is None
+            # Handle no API client (public/synthetic fallback)
             if self.api_client is None:
-                # Return demo account info
+                # Return simulated account info
                 return AccountInfo(
-                    total_balance=10000.0,  # Demo balance
+                    total_balance=10000.0,  # Simulated balance
                     available_balance=9000.0,
                     used_margin=1000.0,
                     margin_ratio=90.0,

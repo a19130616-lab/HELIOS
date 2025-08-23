@@ -47,8 +47,11 @@ services:
       # Sentiment Analysis
       - SENTIMENT_ENABLED=${SENTIMENT_ENABLED:-false}
       
-      # Demo Mode (set to true to bypass API validation)
-      - DEMO_MODE=${DEMO_MODE:-true}
+      # Mode Configuration:
+      #   ALLOW_PUBLIC_MODE: enable read-only public REST ingestion when no valid API keys (default true)
+      #   ALLOW_SYNTHETIC: enable synthetic data when no keys and public mode disabled (default false)
+      - ALLOW_PUBLIC_MODE=${ALLOW_PUBLIC_MODE:-true}
+      - ALLOW_SYNTHETIC=${ALLOW_SYNTHETIC:-false}
       
       # Azure Monitor (optional)
       - AZURE_CONNECTION_STRING=${AZURE_CONNECTION_STRING}

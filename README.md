@@ -24,6 +24,37 @@ A sophisticated, AI-powered cryptocurrency trading bot designed for minute-level
 - **Redis-based Communication**: Fast inter-service messaging and data storage
 - **Azure Monitor Integration**: Cloud-based monitoring and alerting
 
+### Operating Modes
+Helios operates in explicitly gated modes to ensure safe defaults:
+| Mode | Trigger Condition | Data Source | Trading | Active Components |
+|------|------------------|-------------|---------|-------------------|
+| live (testnet/mainnet) | Valid Binance API key & secret | Authenticated WebSocket streams | Enabled | DataIngestor + ExecutionManager + PerformanceTracker |
+| public (read‑only) | Missing/placeholder credentials AND ALLOW_PUBLIC_MODE=true | Binance REST polling + CoinGecko fallback | Disabled | PublicPriceIngestor + DecisionLogger |
+| synthetic (legacy) | ALLOW_SYNTHETIC=true (no valid creds) | Internal generators | Disabled | DataIngestor (synthetic threads) |
+
+Resolution priority: (1) live if valid credentials → (2) public if allowed → (3) synthetic if explicitly enabled → otherwise abort.
+
+### Decision Logging & Simulated PnL
+When trading is disabled (public / synthetic), signals are still produced and persisted:
+- DecisionLogger subscribes to the Redis channel trading_signals and appends normalized entries (list: decision_logs, length ≤500, 24h TTL).
+- Signal directions now include EXIT_LONG and EXIT_SHORT enabling explicit position closure events.
+- Realized PnL is computed only on EXIT_* events using a configurable fixed position size (simulation mode) and stored per entry (realized_pnl, position_size).
+- Aggregated simulated performance metrics are maintained in Redis key simulated_pnl_summary (fields: total_pnl, total_trades, wins, losses, win_rate, max_drawdown_pct, peak_equity, updated_ts).
+- /api/performance automatically falls back to simulated_pnl_summary when no live execution data is available (public/synthetic modes) so the dashboard shows continuous performance feedback.
+
+### EXIT Signal Semantics
+- LONG / SHORT: Open (or replace) a single simulated position per symbol direction.
+- EXIT_LONG / EXIT_SHORT: Close the existing position (if any) and realize PnL = (exit_price - entry_price) * position_size (sign adjusted for direction).
+- Positions are tracked in-memory by DecisionLogger; unmatched EXIT_* events are safely ignored (logged).
+
+### Configuration Additions
+Add a [simulation] section to config/config.ini to control position sizing for simulated PnL (see Configuration section below).
+
+### Safety Principles
+- No implicit "demo" fallback: system aborts if neither credentials nor an allowed read-only/synthetic mode are configured.
+- Mode badge (LIVE / PUBLIC / SYNTHETIC) shown on dashboard and included in /api/prices response.
+- Staleness indicators flag price rows older than threshold (e.g., >60s).
+
 ## 📋 Prerequisites
 
 - **Python 3.9+**: Required for all dependencies
@@ -90,8 +121,8 @@ warning_margin_ratio = 30     # Warning threshold (%)
 critical_margin_ratio = 15    # Emergency threshold (%)
 ```
 
-### 3. Trading Configuration
-Configure signal and trading parameters:
+### 3. Trading & Simulation Configuration
+Configure signal, trading, and (optional) simulation parameters:
 
 ```ini
 [signals]
@@ -102,8 +133,14 @@ ml_confidence_threshold = 0.75     # ML model confidence requirement
 [trading]
 watchlist_size = 5                 # Number of symbols to monitor
 rescan_interval_sec = 300          # Watchlist update interval
+
+[simulation]
+position_size = 1.0                # Fixed contract/asset size used for simulated PnL when trading disabled
 ```
 
+Notes:
+- position_size only affects simulated realized_pnl calculations in public/synthetic modes.
+- EXIT_LONG / EXIT_SHORT signals must be emitted by the strategy logic (SignalEngine) to realize PnL; without EXIT events simulated results remain unrealized.
 ### 4. Azure Monitor (Optional)
 For cloud monitoring, add your Azure connection string:
 

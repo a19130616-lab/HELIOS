@@ -24,14 +24,14 @@ class DataIngestor:
     Processes order book, trade, and kline data and stores in Redis for other services.
     """
     
-    def __init__(self, symbols: List[str], redis_manager: RedisManager, api_client=None):
+    def __init__(self, symbols: List[str], redis_manager: RedisManager, api_client=None, synthetic_mode: bool = False):
         """
         Initialize the Data Ingestor.
         
         Args:
             symbols: List of trading symbols to monitor
             redis_manager: Redis manager instance
-            api_client: Binance API client (None for demo mode)
+            api_client: Binance API client (None when unauthenticated - public/synthetic modes)
         """
         self.symbols = symbols
         self.redis_manager = redis_manager
@@ -39,9 +39,16 @@ class DataIngestor:
         self.logger = logging.getLogger(__name__)
         self.api_client = api_client
         
-        # Check for demo mode
-        self.demo_mode = (api_client is None or
-                         os.getenv('DEMO_MODE', 'false').lower() == 'true')
+        # Synthetic (simulated) mode:
+        # Enabled ONLY when:
+        #   - explicit synthetic_mode param True OR
+        #   - ALLOW_SYNTHETIC=1 and no authenticated api_client
+        self.synthetic_mode = bool(
+            synthetic_mode or (
+                os.getenv('ALLOW_SYNTHETIC', 'false').lower() in ('1', 'true', 'yes', 'on')
+                and api_client is None
+            )
+        )
         
         # WebSocket client
         self.ws_client = None
@@ -57,18 +64,18 @@ class DataIngestor:
         # Stream IDs for cleanup
         self.stream_ids = []
         
-        # Demo mode data generation
-        self.demo_thread = None
-        self.demo_prices = {}  # Track simulated prices for each symbol
+        # Synthetic mode data generation
+        self.synthetic_thread = None
+        self.synthetic_prices = {}  # Track simulated prices for each symbol
         
         # Price logging
         self.price_logging_thread = None
         self.last_price_log_time = 0
         
-        if self.demo_mode:
-            self.logger.warning("🔸 Data Ingestor running in DEMO MODE - Using simulated market data")
-            self._initialize_demo_prices()
-    
+        if self.synthetic_mode:
+            self.logger.warning("🔸 Data Ingestor running in SYNTHETIC MODE (simulated market data) - gated by ALLOW_SYNTHETIC")
+            self._initialize_synthetic_prices()
+        
     def start(self) -> None:
         """Start the data ingestion process."""
         self.logger.info("Starting Data Ingestor...")
@@ -78,11 +85,11 @@ class DataIngestor:
         self.price_logging_thread = threading.Thread(target=self._run_price_logging, daemon=True)
         self.price_logging_thread.start()
         
-        if self.demo_mode:
-            # Start demo data generation
-            self.demo_thread = threading.Thread(target=self._run_demo_mode, daemon=True)
-            self.demo_thread.start()
-            self.logger.info(f"🔸 Data Ingestor started in DEMO MODE for symbols: {self.symbols}")
+        if self.synthetic_mode:
+            # Start synthetic data generation
+            self.synthetic_thread = threading.Thread(target=self._run_synthetic_mode, daemon=True)
+            self.synthetic_thread.start()
+            self.logger.info(f"🔸 Data Ingestor started in SYNTHETIC MODE for symbols: {self.symbols}")
         else:
             # Start WebSocket client in a separate thread
             self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
@@ -427,13 +434,13 @@ class DataIngestor:
             'order_books_active': len(self.order_books),
             'latest_trades_active': len(self.latest_trades),
             'websocket_connected': self.ws_client is not None,
-            'demo_mode': self.demo_mode
+            'synthetic_mode': self.synthetic_mode
         }
 
-    def _initialize_demo_prices(self) -> None:
-        """Initialize demo prices for simulation."""
+    def _initialize_synthetic_prices(self) -> None:
+        """Initialize synthetic prices for simulation."""
         # Realistic starting prices for major crypto pairs
-        demo_prices = {
+        base_prices = {
             'BTCUSDT': 45000.0,
             'ETHUSDT': 2800.0,
             'BNBUSDT': 320.0,
@@ -445,41 +452,41 @@ class DataIngestor:
         }
         
         for symbol in self.symbols:
-            if symbol in demo_prices:
-                self.demo_prices[symbol] = demo_prices[symbol]
+            if symbol in base_prices:
+                self.synthetic_prices[symbol] = base_prices[symbol]
             else:
                 # Generate random price for unknown symbols
-                self.demo_prices[symbol] = random.uniform(1.0, 100.0)
+                self.synthetic_prices[symbol] = random.uniform(1.0, 100.0)
 
-    def _run_demo_mode(self) -> None:
-        """Run demo mode with simulated market data."""
-        self.logger.info("🔸 Starting demo data generation...")
+    def _run_synthetic_mode(self) -> None:
+        """Run synthetic mode with simulated market data (used only when ALLOW_SYNTHETIC enabled)."""
+        self.logger.info("🔸 Starting synthetic data generation...")
         
         while self.is_running:
             try:
                 for symbol in self.symbols:
-                    self._generate_demo_orderbook(symbol)
-                    self._generate_demo_trade(symbol)
+                    self._generate_synthetic_orderbook(symbol)
+                    self._generate_synthetic_trade(symbol)
                     
                     # Generate kline every minute
                     if int(time.time()) % 60 == 0:
-                        self._generate_demo_kline(symbol)
+                        self._generate_synthetic_kline(symbol)
                 
                 # Update every 100ms to simulate high-frequency data
                 time.sleep(0.1)
                 
             except Exception as e:
-                self.logger.error(f"Error in demo mode: {e}")
+                self.logger.error(f"Error in synthetic mode: {e}")
                 time.sleep(1)
 
-    def _generate_demo_orderbook(self, symbol: str) -> None:
+    def _generate_synthetic_orderbook(self, symbol: str) -> None:
         """Generate simulated order book data."""
-        current_price = self.demo_prices[symbol]
+        current_price = self.synthetic_prices[symbol]
         
         # Add some random price movement (-0.1% to +0.1%)
         price_change = random.uniform(-0.001, 0.001)
         new_price = current_price * (1 + price_change)
-        self.demo_prices[symbol] = new_price
+        self.synthetic_prices[symbol] = new_price
         
         # Generate order book levels
         bids = []
@@ -509,9 +516,9 @@ class DataIngestor:
         self.order_books[symbol] = order_book
         self._store_order_book(order_book)
 
-    def _generate_demo_trade(self, symbol: str) -> None:
+    def _generate_synthetic_trade(self, symbol: str) -> None:
         """Generate simulated trade data."""
-        current_price = self.demo_prices[symbol]
+        current_price = self.synthetic_prices[symbol]
         
         # Generate trade around current price
         trade_price = current_price * random.uniform(0.9999, 1.0001)
@@ -531,9 +538,9 @@ class DataIngestor:
         self.latest_trades[symbol] = trade
         self._store_trade(trade)
 
-    def _generate_demo_kline(self, symbol: str) -> None:
+    def _generate_synthetic_kline(self, symbol: str) -> None:
         """Generate simulated kline data."""
-        current_price = self.demo_prices[symbol]
+        current_price = self.synthetic_prices[symbol]
         
         # Generate OHLC data with some volatility
         open_price = current_price * random.uniform(0.999, 1.001)
@@ -594,13 +601,13 @@ class DataIngestor:
         price_info = []
         
         # Always try to log something to confirm the logging is working
-        mode_indicator = "📊 DEMO" if self.demo_mode else "📈 LIVE"
+        mode_indicator = "🧪 SYNTHETIC" if self.synthetic_mode else "📈 LIVE"
         
         for symbol in self.symbols:
             try:
-                if self.demo_mode:
-                    # Use demo prices
-                    current_price = self.demo_prices.get(symbol)
+                if self.synthetic_mode:
+                    # Use synthetic prices
+                    current_price = self.synthetic_prices.get(symbol)
                     if current_price is not None and current_price > 0:
                         price_info.append(f"{symbol}: ${current_price:.4f}")
                     else:

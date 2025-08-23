@@ -13,6 +13,45 @@ The Helios Trading System is now a comprehensive containerized cryptocurrency tr
 - **Health Monitoring**: Web dashboard for system status and metrics
 - **Advanced Risk Management**: Dynamic position sizing with sentiment-adjusted Kelly criterion
 
+## Operating Modes
+
+Helios supports multiple operating modes with explicit environment gating:
+
+| Mode | Trigger | Data Source | Trading | Component Path |
+|------|--------|-------------|---------|----------------|
+| live (testnet/mainnet) | Valid Binance API key & secret | WebSocket (authenticated futures streams) | Enabled (ExecutionManager) | DataIngestor + ExecutionManager |
+| public | Missing/placeholder credentials AND ALLOW_PUBLIC_MODE=true | REST polling (Binance public + CoinGecko fallback) | Disabled | PublicPriceIngestor (read-only) |
+| synthetic (legacy) | ALLOW_SYNTHETIC=true (explicit) when no valid credentials | Internal simulated generators | Disabled | DataIngestor synthetic threads (gated) |
+
+Environment Flags:
+- ALLOW_PUBLIC_MODE=true (default) enables graceful downgrade to read-only public mode without trading.
+- ALLOW_SYNTHETIC=false (default). Turn on ONLY for local testing when you want simulated market flow.
+
+Mode Resolution Rules (priority):
+1. Valid credentials ⇒ live
+2. No credentials & ALLOW_PUBLIC_MODE=true ⇒ public
+3. Else if ALLOW_SYNTHETIC=true ⇒ synthetic
+4. Else startup aborts (require credentials or enable public/synthetic)
+
+Dashboard Mode Badge:
+- Displays LIVE / PUBLIC / SYNTHETIC and price data row staleness (age > 60s marked with * and dimmed).
+
+Decision Logging & Simulated PnL:
+- SignalEngine publishes structured signals to Redis channel trading_signals.
+- Signal directions include EXIT_LONG and EXIT_SHORT enabling explicit closure of simulated positions when trading is disabled.
+- DecisionLogger subscribes and persists normalized JSON entries into Redis list decision_logs (TTL 24h, bounded length) including optional fields realized_pnl and position_size.
+- Realized PnL is computed only on EXIT_* events using a fixed simulation position size (see [simulation] config) and aggregated into Redis key simulated_pnl_summary.
+- /api/decisions endpoint returns recent entries (default limit=50).
+- /api/performance automatically falls back to simulated_pnl_summary when no live execution metrics are present (public / synthetic modes).
+
+Redis Keys (Schema Additions):
+- trade:{SYMBOL} (latest trade price, 30s TTL)
+- orderbook:{SYMBOL} (mid-price + depth snapshot, 60s TTL)
+- kline:{SYMBOL} (latest aggregated candle, 300s TTL)
+- klines:{SYMBOL} (list of recent candles, size 200, 1h TTL)
+- decision_logs (LPUSH list of DecisionLog objects, length ≤500, 24h TTL; entries may include realized_pnl, position_size if EXIT_* processed)
+- simulated_pnl_summary (hash: total_pnl, total_trades, wins, losses, win_rate, max_drawdown_pct, peak_equity, updated_ts) – maintained only when trading disabled
+
 ## Quick Start
 
 ### 1. Environment Setup
@@ -36,7 +75,11 @@ Add these to your `.env` file:
 ```bash
 # Binance API (Required)
 BINANCE_API_KEY=your_binance_api_key
-BINANCE_SECRET_KEY=your_binance_secret_key
+BINANCE_API_SECRET=your_binance_api_secret
+# Public read-only mode (no trading) allowed when credentials invalid/missing
+ALLOW_PUBLIC_MODE=true
+# Enable legacy synthetic (simulated) data generation (off by default, gated)
+ALLOW_SYNTHETIC=false
 
 # Reddit API (Required for sentiment analysis)
 REDDIT_CLIENT_ID=your_reddit_client_id
@@ -104,41 +147,72 @@ trend_strength_threshold = 0.6
 enable = true
 port = 8080
 refresh_interval = 30
+
+[simulation]
+position_size = 1.0   # Fixed notional/contract size for simulated PnL when trading disabled
 ```
+
+Simulation Notes:
+- Simulated realized PnL is only computed upon EXIT_LONG / EXIT_SHORT signals.
+- Unmatched EXIT_* (no open position) are ignored safely.
+- /api/performance merges into live metrics automatically when trading becomes enabled (simulated_pnl_summary is ignored in live mode).
 
 ## Architecture
 
 ### Service Components
 
 1. **Main Trading Engine** (`main.py`)
-   - Orchestrates all trading components
-   - Manages real-time data flow
-   - Executes trading decisions
+   - Orchestrates all components
+   - Coordinates mode selection (live/public/synthetic)
+   - Lifecycle management & graceful shutdown
 
-2. **Sentiment Analysis** (`app/sentiment_utils.py`)
-   - VADER sentiment with crypto lexicon
-   - Reddit post processing and filtering
-   - Time-decay weighted aggregation
+2. **Data Ingestion (Live)** (`app/data_ingestor.py`)
+   - Authenticated Binance futures websocket streams
+   - Order book, trades, klines
+   - Active only in live mode
 
-3. **Reddit Ingestion** (`app/reddit_ingestor.py`)
-   - Multi-subreddit monitoring
-   - Real-time post collection
-   - Spam and quality filtering
+3. **Public Price Ingestion (Read-Only)** (`app/public_price_ingestor.py`)
+   - Binance REST polling + CoinGecko fallback
+   - Normalizes to same Redis schema as live
+   - Active only in public mode
 
-4. **Signal Engine** (`app/signal_engine.py`)
-   - Multi-timeframe technical analysis
-   - Sentiment-enhanced decision logic
-   - ML-based signal filtering
+4. **Synthetic Ingestion (Legacy / Optional)**
+   - Simulated data generation threads
+   - Gated by ALLOW_SYNTHETIC=true
+   - Disabled by default
 
-5. **Performance Tracker** (`app/performance_tracker.py`)
-   - Real-time P&L tracking
-   - Trade analytics and reporting
-   - Risk metrics calculation
+5. **Signal Engine** (`app/signal_engine.py`)
+   - Multi-timeframe technical / sentiment fusion
+   - Publishes structured signals → Redis channel trading_signals
+   - Throttling & confidence scoring
 
-6. **Health Dashboard** (HTTP endpoint)
-   - System status monitoring
-   - Component health checks
-   - Performance metrics display
+6. **Decision Logger** (`app/decision_logger.py`)
+   - Subscribes trading_signals
+   - Persists bounded list decision_logs with TTL
+   - Powers /api/decisions dashboard table
+
+7. **Risk Manager** (`app/risk_manager.py`)
+   - Position sizing & exposure constraints
+   - Still initialized in public mode (dry-run logic)
+
+8. **Execution Manager** (`app/execution_manager.py`)
+   - Order placement / management (live mode only)
+
+9. **Performance Tracker** (`app/performance_tracker.py`)
+   - Real-time P&L and trade analytics
+   - Aggregated performance_metrics key
+
+10. **Reddit Ingestion & Sentiment** (`app/reddit_ingestor.py`, `app/sentiment_utils.py`)
+    - Streaming subreddit posts
+    - Domain-specific sentiment scoring
+
+11. **Monitoring Agent** (`app/monitoring_agent.py`)
+    - Periodic system health snapshots
+    - Alerting hooks (extendable)
+
+12. **Health Dashboard** (HTTP endpoints)
+    - /api/prices, /api/decisions, /api/health, /api/performance, /api/metrics
+    - Live HTML dashboard with mode badge & staleness indicators
 
 ### Data Flow
 
@@ -158,13 +232,19 @@ The system provides comprehensive health monitoring:
 
 ```bash
 # System health
-curl http://localhost:8080/health
+curl http://localhost:8080/api/health
 
-# Component status
-curl http://localhost:8080/status
+# Live prices (mode + staleness + per-symbol latest price)
+curl http://localhost:8080/api/prices
 
-# Performance metrics
-curl http://localhost:8080/metrics
+# Recent decisions (trading signals normalized & persisted)
+curl http://localhost:8080/api/decisions
+
+# Performance metrics (PnL + recent trades)
+curl http://localhost:8080/api/performance
+
+# Raw metrics summary
+curl http://localhost:8080/api/metrics
 ```
 
 ### Log Monitoring
