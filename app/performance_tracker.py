@@ -87,18 +87,66 @@ class PerformanceTracker:
         self._setup_trade_subscription()
     
     def start(self) -> None:
-        """Start the performance tracker."""
+        """Start the performance tracker (fresh session metrics only)."""
         self.logger.info("Starting Performance Tracker...")
         self.is_running = True
-        
-        # Load historical data
-        self._load_historical_data()
-        
+
+        # IMPORTANT: Explicitly reset all in‑memory state so a hot-restart (without full process exit)
+        # does NOT retain prior run's trade history / portfolio stats.
+        self.trade_records = []
+        self.daily_pnl = {}
+        self.portfolio_value_history = []
+        self.peak_portfolio_value = 0.0
+        self.start_time = get_timestamp()
+
+        # Fresh session: intentionally DO NOT load historical trade_records so that
+        # performance metrics reflect only the current runtime.
+        # (Historical trade_record:* data remains in Redis for inspection if needed.)
+        # self._load_historical_data()
+
+        # Remove any persisted historical aggregate metrics so dashboard does not show stale history.
+        try:
+            self.redis_manager.redis_client.delete("performance_metrics")
+        except Exception as e:
+            self.logger.warning(f"Could not delete old performance_metrics key: {e}")
+
+        # Publish a baseline zeroed metrics snapshot immediately so UI shows a clean slate.
+        baseline = PerformanceMetrics(
+            total_trades=0,
+            winning_trades=0,
+            losing_trades=0,
+            win_rate=0.0,
+            total_pnl=0.0,
+            total_pnl_percentage=0.0,
+            average_win=0.0,
+            average_loss=0.0,
+            largest_win=0.0,
+            largest_loss=0.0,
+            profit_factor=0.0,
+            sharpe_ratio=0.0,
+            max_drawdown=0.0,
+            current_drawdown=0.0,
+            average_trade_duration=0.0,
+            trades_per_day=0.0,
+            start_time=self.start_time,
+            end_time=self.start_time
+        )
+        baseline_dict = asdict(baseline)
+        # UI compatibility: dashboard expects max_drawdown_pct; provide both.
+        baseline_dict['max_drawdown_pct'] = baseline.max_drawdown
+        # Add explicit session start marker
+        baseline_dict['session_start_ts'] = self.start_time
+        try:
+            self.redis_manager.set_data("performance_metrics", baseline_dict, expiry=3600)
+            self.redis_manager.publish("performance_updates", baseline_dict)
+        except Exception as e:
+            self.logger.warning(f"Failed to publish baseline performance metrics: {e}")
+
         # Start reporting thread
         self.report_thread = threading.Thread(target=self._run_periodic_reports, daemon=True)
         self.report_thread.start()
-        
-        self.logger.info("Performance Tracker started")
+
+        self.logger.info("Performance Tracker started (fresh session metrics only)")
     
     def stop(self) -> None:
         """Stop the performance tracker."""
@@ -352,22 +400,31 @@ class PerformanceTracker:
             if len(self.trade_records) == 0:
                 self.logger.info("No trades recorded yet for performance analysis")
                 return
-            
+
             # Calculate metrics
             metrics = self.calculate_performance_metrics()
-            
+
+            # Prepare dict and add UI compatibility / session fields
+            metrics_dict = asdict(metrics)
+            # Dashboard expects max_drawdown_pct (legacy field name); mirror value
+            metrics_dict['max_drawdown_pct'] = metrics.max_drawdown
+            # Include explicit session start timestamp for clarity
+            metrics_dict['session_start_ts'] = self.start_time
+
             # Log summary
-            self.logger.info(f"Performance Report - Trades: {metrics.total_trades}, "
-                           f"Win Rate: {metrics.win_rate:.1f}%, "
-                           f"Total PnL: ${metrics.total_pnl:.2f}, "
-                           f"Profit Factor: {metrics.profit_factor:.2f}")
-            
+            self.logger.info(
+                f"Performance Report - Trades: {metrics.total_trades}, "
+                f"Win Rate: {metrics.win_rate:.1f}%, "
+                f"Total PnL: ${metrics.total_pnl:.2f}, "
+                f"Profit Factor: {metrics.profit_factor:.2f}"
+            )
+
             # Store detailed metrics in Redis
-            self.redis_manager.set_data("performance_metrics", asdict(metrics), expiry=3600)
-            
+            self.redis_manager.set_data("performance_metrics", metrics_dict, expiry=3600)
+
             # Publish performance update
-            self.redis_manager.publish("performance_updates", asdict(metrics))
-            
+            self.redis_manager.publish("performance_updates", metrics_dict)
+
         except Exception as e:
             self.logger.error(f"Error generating performance report: {e}")
     
