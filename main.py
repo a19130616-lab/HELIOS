@@ -120,6 +120,28 @@ class HeliosSystem:
             self.redis_manager = RedisManager(redis_host, redis_port, redis_db)
             self.logger.info("Redis connection established")
             
+            # Optional: clear persisted Redis state on startup to avoid inheriting
+            # previous run metrics/positions during development or CI.
+            try:
+                clear_flag_env = os.getenv('CLEAR_REDIS_ON_STARTUP')
+                clear_flag_cfg = None
+                try:
+                    # Config uses string -> fallback to 'false' if not present
+                    clear_flag_cfg = str(self.config.get('system', 'clear_redis_on_startup', fallback='false'))
+                except Exception:
+                    clear_flag_cfg = 'false'
+                clear_flag = (str(clear_flag_env).lower() in ("1","true","yes","on")) or (str(clear_flag_cfg).lower() in ("1","true","yes","on"))
+                if clear_flag:
+                    self.logger.info("CLEAR_REDIS_ON_STARTUP enabled - flushing Redis database to reset state")
+                    try:
+                        self.redis_manager.redis_client.flushdb()
+                        self.logger.info("Redis database flushed successfully")
+                    except Exception as e:
+                        self.logger.error(f"Failed to flush Redis database: {e}")
+            except Exception:
+                # Non-fatal: don't block startup if clearing check fails
+                pass
+            
         except Exception as e:
             self.logger.error(f"Failed to initialize Redis: {e}")
             raise

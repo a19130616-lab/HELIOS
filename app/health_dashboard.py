@@ -196,6 +196,17 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 system_status = self.system_reference.get_system_status()
                 health_data.update(system_status)
                 health_data['system_status'] = 'running' if system_status.get('is_running') else 'stopped'
+                # Include explicit testnet flag so the dashboard can indicate TESTNET vs PROD
+                try:
+                    # self.config is initialized in HealthDashboard.__init__
+                    health_data['binance_testnet'] = bool(self.config.get('binance', 'testnet', fallback=False))
+                except Exception:
+                    # Fallback: try to read from system_reference config if available
+                    try:
+                        cfg = get_config()
+                        health_data['binance_testnet'] = bool(cfg.get('binance', 'testnet', fallback=False))
+                    except Exception:
+                        health_data['binance_testnet'] = False
             
             return health_data
             
@@ -1049,6 +1060,33 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 '<span class="status-indicator status-stopped"></span>';
             
             const uptime = data.uptime_seconds ? (data.uptime_seconds / 60).toFixed(1) : 0;
+
+            // Update the global mode badge (shows LIVE/TESTNET/PUBLIC/SYNTHETIC)
+            const badge = document.getElementById('modeBadge');
+            if (badge) {
+                const op = (data.operational_mode || '').toLowerCase();
+                const isTestnet = data.binance_testnet === true;
+                let modeText = (op ? op.toUpperCase() : (data.mode ? data.mode.toUpperCase() : 'UNKNOWN'));
+
+                if (op === 'live') {
+                    modeText = isTestnet ? 'LIVE (TESTNET)' : 'LIVE (PROD)';
+                } else if (op === 'public') {
+                    modeText = 'PUBLIC (READ-ONLY)';
+                } else if (op === 'synthetic') {
+                    modeText = 'SYNTHETIC';
+                }
+
+                badge.textContent = modeText;
+                badge.classList.remove('badge-live','badge-public','badge-synthetic');
+
+                if (op === 'live') {
+                    badge.classList.add('badge-live');
+                } else if (op === 'public') {
+                    badge.classList.add('badge-public');
+                } else {
+                    badge.classList.add('badge-synthetic');
+                }
+            }
             
             element.innerHTML = `
                 <div class="metric-row">
