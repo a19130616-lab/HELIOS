@@ -39,7 +39,26 @@ class ExecutionManager:
         self.logger = logging.getLogger(__name__)
         
         # Configuration
-        self.leverage = self.config.get('risk', 'leverage', int)
+        # leverage configured as integer
+        try:
+            self.leverage = self.config.get('risk', 'leverage', int)
+        except Exception:
+            # fallback default
+            self.leverage = 1
+        
+        # Optional: use exchange-native OCO where available.
+        # Config value supports 'true'/'false' (string) or boolean.
+        try:
+            raw_val = self.config.get('risk', 'use_exchange_oco', fallback='true')
+            self.use_exchange_oco = str(raw_val).lower() in ('1', 'true', 'yes', 'y')
+        except Exception:
+            self.use_exchange_oco = True
+        
+        # TTL for persisted stop metadata (seconds)
+        try:
+            self.persistent_stop_ttl = int(self.config.get('risk', 'persistent_stop_ttl_seconds', fallback='86400'))
+        except Exception:
+            self.persistent_stop_ttl = 24 * 3600  # 1 day
         
         # Execution state
         self.is_running = False
@@ -48,6 +67,10 @@ class ExecutionManager:
         # Order tracking
         self.active_orders = {}  # order_id -> order_info
         self.pending_signals = {}  # symbol -> signal
+        
+        # Persisted OCO / stop metadata (in-memory index to the redis record)
+        # key: symbol -> metadata { id, stop_order_id, tp_order_id, redis_key }
+        self.persistent_stops = {}
         
         # Performance tracking
         self.orders_executed = 0

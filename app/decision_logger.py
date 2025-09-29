@@ -377,7 +377,15 @@ class DecisionLogger:
                             realized_pnl=realized,
                             position_size=pos_size,
                         )
-                        self._push_decision(exit_decision.to_dict())
+                        # Augment decision with USD notional / capital used for dashboard visibility
+                        dec_dict = exit_decision.to_dict()
+                        try:
+                            dec_dict['position_value_usd'] = (dec_dict.get('position_size') or 0) * (dec_dict.get('entry_price') or 0)
+                            if self.futures_mode:
+                                dec_dict['capital_used_usd'] = dec_dict['position_value_usd'] / (self.leverage or 1.0)
+                        except Exception:
+                            pass
+                        self._push_decision(dec_dict)
 
                     # Determine position size
                     size = self.position_size
@@ -449,8 +457,16 @@ class DecisionLogger:
                     self.position_size if direction in (SignalDirection.LONG, SignalDirection.SHORT) else None
                 ),
             )
-
+    
             decision_dict = decision.to_dict()
+            # Add dollar amount metadata for dashboard: notional / capital used
+            try:
+                decision_dict['position_value_usd'] = (decision_dict.get('position_size') or 0) * (decision_dict.get('entry_price') or 0)
+                if self.futures_mode:
+                    decision_dict['capital_used_usd'] = decision_dict['position_value_usd'] / (self.leverage or 1.0)
+            except Exception:
+                pass
+    
             self._push_decision(decision_dict)
             self._persist_open_positions()
 
@@ -511,7 +527,15 @@ class DecisionLogger:
             realized_pnl=realized,
             position_size=size,
         )
-        self._push_decision(exit_decision.to_dict())
+        # Augment with USD notional for dashboard
+        ed = exit_decision.to_dict()
+        try:
+            ed['position_value_usd'] = (ed.get('position_size') or 0) * (ed.get('entry_price') or 0)
+            if self.futures_mode:
+                ed['capital_used_usd'] = ed['position_value_usd'] / (self.leverage or 1.0)
+        except Exception:
+            pass
+        self._push_decision(ed)
         self._persist_open_positions()
 
     # ------------------------------------------------------------------------------------

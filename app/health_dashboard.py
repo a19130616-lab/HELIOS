@@ -1022,6 +1022,11 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 <div id="recentTrades">Loading...</div>
             </div>
 
+            <div class="status-card">
+                <h3>Alarms</h3>
+                <div id="portfolioAlarms">Loading...</div>
+            </div>
+
             <div class="status-card decisions-card">
                 <h3>Decisions</h3>
                 <div id="decisionsLog" class="decisions-table-wrapper">Loading...</div>
@@ -1102,6 +1107,36 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     <span class="metric-value">${data.watchlist ? data.watchlist.length : 0} symbols</span>
                 </div>
             `;
+            
+            // If signal engine reports 10-minute metrics, show them compactly
+            try {
+                if (data.components && data.components.signal_engine) {
+                    const se = data.components.signal_engine;
+                    const tenMode = se.ten_min_mode ? 'ENABLED' : 'DISABLED';
+                    element.innerHTML += `
+                        <div class="metric-row">
+                            <span class="metric-label">10m Mode:</span>
+                            <span class="metric-value">${tenMode}</span>
+                        </div>
+                    `;
+                    if (se.ten_min_metrics) {
+                        // show small per-symbol confirmed_signals summary
+                        let metricsHtml = '<div style="margin-top:8px">';
+                        for (const [sym, m] of Object.entries(se.ten_min_metrics)) {
+                            metricsHtml += `
+                                <div class="metric-row">
+                                    <span class="metric-label">${sym}:</span>
+                                    <span class="metric-value">${m.confirmed_signals || 0} confirmed</span>
+                                </div>
+                            `;
+                        }
+                        metricsHtml += '</div>';
+                        element.innerHTML += metricsHtml;
+                    }
+                }
+            } catch (e) {
+                console.error('Error showing 10m metrics', e);
+            }
         }
 
         async function updateComponentHealth() {
@@ -1226,7 +1261,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 element.innerHTML = '<p>No recent trades</p>';
                 return;
             }
-
+    
             let tableHtml = `
                 <table>
                     <thead>
@@ -1239,7 +1274,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     </thead>
                     <tbody>
             `;
-
+    
             data.recent_trades.slice(-5).forEach(trade => {
                 const pnlClass = trade.pnl >= 0 ? 'profit' : 'loss';
                 tableHtml += `
@@ -1251,9 +1286,56 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     </tr>
                 `;
             });
-
+    
             tableHtml += '</tbody></table>';
             element.innerHTML = tableHtml;
+        }
+    
+        // Render portfolio alarms (stop-loss / circuit-breaker events)
+        async function updatePortfolioAlarms() {
+            const perf = await fetchData('/api/performance');
+            const element = document.getElementById('portfolioAlarms');
+    
+            if (perf.error || !perf.performance) {
+                element.innerHTML = '<p>No alarms data</p>';
+                return;
+            }
+    
+            const alarms = perf.performance.alarms || [];
+            if (!alarms || alarms.length === 0) {
+                element.innerHTML = '<p>No recent alarms</p>';
+                return;
+            }
+    
+            let html = `<table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Symbol</th>
+                        <th>Type</th>
+                        <th>Price</th>
+                        <th>Size</th>
+                    </tr>
+                </thead>
+                <tbody>
+            `;
+    
+            alarms.slice(0, 20).forEach(a => {
+                const dt = new Date(a.timestamp);
+                const t = dt.toLocaleTimeString();
+                html += `
+                    <tr>
+                        <td>${t}</td>
+                        <td>${a.symbol}</td>
+                        <td>${a.type}</td>
+                        <td>${a.price !== undefined ? a.price : '-'}</td>
+                        <td>${a.size !== undefined ? a.size : '-'}</td>
+                    </tr>
+                `;
+            });
+    
+            html += '</tbody></table>';
+            element.innerHTML = html;
         }
 
         function formatPrice(p) {
@@ -1348,63 +1430,69 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
         }
 
         async function updateDecisions() {
-            const element = document.getElementById('decisionsLog');
-            const data = await fetchData('/api/decisions?limit=50');
-
-            if (data.error) {
-                element.innerHTML = `<p>Error: ${data.error}</p>`;
-                return;
-            }
-            if (!data.decisions || data.decisions.length === 0) {
-                element.innerHTML = '<p>No decisions logged</p>';
-                return;
-            }
-
-            let html = `<table>
-                <thead>
-                    <tr>
-                        <th>Time</th>
-                        <th>Sym</th>
-                        <th>Dir</th>
-                        <th>Conf%</th>
-                        <th>NOBI</th>
-                        <th>PnL</th>
-                        <th>Mode</th>
-                        <th>Reason</th>
-                    </tr>
-                </thead>
-                <tbody>
-            `;
-
-            data.decisions.forEach(d => {
-                const dt = new Date(d.timestamp);
-                const t = dt.toLocaleTimeString();
-                const dir = d.direction;
-                let dirClass = '';
-                if (dir === 'LONG' || dir === 'EXIT_LONG') dirClass = 'dir-long';
-                else if (dir === 'SHORT' || dir === 'EXIT_SHORT') dirClass = 'dir-short';
-                const confPct = (d.confidence * 100).toFixed(1);
-                const confClass = classifyConfidence(d.confidence);
-                const pnl = d.realized_pnl !== null && d.realized_pnl !== undefined ? d.realized_pnl : '';
-                const pnlClass = pnl !== '' ? (pnl >= 0 ? 'profit' : 'loss') : '';
-                const dirDisplay = (dir.startsWith('EXIT_') ? 'EXIT' : dir);
-                html += `
-                    <tr>
-                        <td>${t}</td>
-                        <td>${d.symbol}</td>
-                        <td class="${dirClass}">${dirDisplay}</td>
-                        <td class="${confClass}">${confPct}</td>
-                        <td>${(d.nobi_value ?? 0).toFixed(3)}</td>
-                        <td class="${pnlClass}">${pnl !== '' ? ('$' + pnl.toFixed(2)) : ''}</td>
-                        <td>${d.mode}</td>
-                        <td title="${d.reason || ''}">${d.reason ? d.reason.substring(0,18) : ''}</td>
-                    </tr>
+                const element = document.getElementById('decisionsLog');
+                const data = await fetchData('/api/decisions?limit=50');
+        
+                if (data.error) {
+                    element.innerHTML = `<p>Error: ${data.error}</p>`;
+                    return;
+                }
+                if (!data.decisions || data.decisions.length === 0) {
+                    element.innerHTML = '<p>No decisions logged</p>';
+                    return;
+                }
+        
+                let html = `<table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Sym</th>
+                            <th>Dir</th>
+                            <th>Conf%</th>
+                            <th>NOBI</th>
+                            <th>Notional</th>
+                            <th>Capital</th>
+                            <th>PnL</th>
+                            <th>Mode</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody>
                 `;
-            });
-
-            html += '</tbody></table>';
-            element.innerHTML = html;
-        }
+        
+                data.decisions.forEach(d => {
+                    const dt = new Date(d.timestamp);
+                    const t = dt.toLocaleTimeString();
+                    const dir = d.direction;
+                    let dirClass = '';
+                    if (dir === 'LONG' || dir === 'EXIT_LONG') dirClass = 'dir-long';
+                    else if (dir === 'SHORT' || dir === 'EXIT_SHORT') dirClass = 'dir-short';
+                    const confPct = (d.confidence * 100).toFixed(1);
+                    const confClass = classifyConfidence(d.confidence);
+                    const pnl = d.realized_pnl !== null && d.realized_pnl !== undefined ? d.realized_pnl : '';
+                    const pnlClass = pnl !== '' ? (pnl >= 0 ? 'profit' : 'loss') : '';
+                    const dirDisplay = (dir.startsWith('EXIT_') ? 'EXIT' : dir);
+                    const notional = d.position_value_usd ? ('$' + Number(d.position_value_usd).toFixed(2)) : '';
+                    const capital = d.capital_used_usd ? ('$' + Number(d.capital_used_usd).toFixed(2)) : '';
+                    html += `
+                        <tr>
+                            <td>${t}</td>
+                            <td>${d.symbol}</td>
+                            <td class="${dirClass}">${dirDisplay}</td>
+                            <td class="${confClass}">${confPct}</td>
+                            <td>${(d.nobi_value ?? 0).toFixed(3)}</td>
+                            <td>${notional}</td>
+                            <td>${capital}</td>
+                            <td class="${pnlClass}">${pnl !== '' ? ('$' + pnl.toFixed(2)) : ''}</td>
+                            <td>${d.mode}</td>
+                            <td title="${d.reason || ''}">${d.reason ? d.reason.substring(0,18) : ''}</td>
+                        </tr>
+                    `;
+                });
+        
+                html += '</tbody></table>';
+                element.innerHTML = html;
+            }
 
         async function refreshAll() {
             // Optional first-load trend reset (keeps initial historical sequence clean)
@@ -1420,6 +1508,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 updateComponentHealth(),
                 updatePerformanceMetrics(),
                 updateRecentTrades(),
+                updatePortfolioAlarms(),
                 updateDecisions()
             ]);
             

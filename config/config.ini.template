@@ -7,6 +7,9 @@ testnet = True
 connection_string = YOUR_CONNECTION_STRING
 
 [trading]
+# Optional explicit watchlist (comma-separated). If set, this list is preferred over auto-detection.
+# Example: watchlist = BTCUSDT,ETHUSDT,BNBUSDT,ADAUSDT,SOLUSDT
+watchlist = BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,XRPUSDT
 watchlist_size = 5
 rescan_interval_sec = 300
 

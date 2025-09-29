@@ -251,12 +251,32 @@ class HeliosSystem:
             raise
     
     def _initialize_watchlist(self) -> None:
-        """Initialize trading symbol watchlist."""
+        """Initialize trading symbol watchlist.
+        
+        Priority:
+          1. Explicit comma-separated `watchlist` under [trading] in config (preferred)
+          2. Defaults / exchange-derived watchlist (existing behavior)
+        """
         try:
-            default_watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSUT']  # note: SOLUSUT typo kept intentionally? correcting below
-            # Correct any typos
+            # 1) Check config for explicit watchlist string
+            try:
+                configured = self.config.get('trading', 'watchlist', fallback='')
+                if configured:
+                    # Parse comma-separated list and normalize
+                    parsed = [s.strip().upper() for s in configured.split(',') if s.strip()]
+                    if parsed:
+                        self.watchlist = parsed
+                        self.logger.info(f"Using configured watchlist from config: {self.watchlist}")
+                        return
+            except Exception:
+                # Ignore parsing errors and fall back to automatic behavior
+                pass
+    
+            # 2) Fallback to previous default / exchange-driven logic
+            default_watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSUT']  # keep original intent
+            # Correct any obvious typo
             default_watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
-
+    
             if self.api_client is None:
                 # Public mode - we may later enhance to fetch top volume via public endpoint
                 self.watchlist = default_watchlist
@@ -264,11 +284,18 @@ class HeliosSystem:
             else:
                 exchange_info = self.api_client.exchange_info()
                 available_symbols = [s['symbol'] for s in exchange_info['symbols'] if s['status'] == 'TRADING']
+                # Prefer configured symbols if they exist in the exchange; otherwise use defaults intersect
                 self.watchlist = [symbol for symbol in default_watchlist if symbol in available_symbols]
                 if not self.watchlist:
-                    raise ValueError("No valid trading symbols found")
+                    # As a last resort use top-volume symbols from exchange
+                    try:
+                        tickers = self.api_client.ticker_24hr_price_change()
+                        usdt_pairs = [t['symbol'] for t in tickers if t['symbol'].endswith('USDT')]
+                        self.watchlist = usdt_pairs[:5]
+                    except Exception:
+                        raise ValueError("No valid trading symbols found")
                 self.logger.info(f"Initialized watchlist: {self.watchlist}")
-
+    
         except Exception as e:
             self.logger.error(f"Failed to initialize watchlist: {e}")
             self.watchlist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']

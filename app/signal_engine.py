@@ -49,6 +49,24 @@ class SignalEngine:
         self.feature_scaler = None
         self._load_ml_model()
         
+        # 10-minute strategy / aggregation mode (feature-flagged)
+        try:
+            # Use config flag to enable 10-minute mode (fallback False)
+            self.use_10m_mode = bool(self.config.get('signals', 'use_10m_mode', fallback=False))
+        except Exception:
+            self.use_10m_mode = False
+        try:
+            self.confirm_n = int(self.config.get('signals', 'confirm_n', fallback=2))
+            self.confirm_m = int(self.config.get('signals', 'confirm_m', fallback=3))
+        except Exception:
+            self.confirm_n = 2
+            self.confirm_m = 3
+        # Per-symbol recent confirmation history (stores last confirm_m directions as 'LONG'/'SHORT')
+        self.ten_min_history = {symbol: [] for symbol in symbols}
+        self._last_10m_run = 0
+        # Expose lightweight metrics for dashboard
+        self.ten_min_metrics = {symbol: {'confirmed_signals': 0, 'last_confirm_ts': 0} for symbol in symbols}
+        
         # Signal generation state
         self.is_running = False
         self.signal_queue = Queue()
@@ -123,12 +141,25 @@ class SignalEngine:
         """Main signal generation loop."""
         while self.is_running:
             try:
-                # Process each symbol
-                for symbol in self.symbols:
-                    self._process_symbol_signals(symbol)
-                
-                # Small delay to prevent excessive CPU usage
-                time.sleep(0.1)
+                if self.use_10m_mode:
+                    # Run coarse 10-minute processing. Check boundary every second and execute once per 10m.
+                    now = get_timestamp()
+                    # Ensure we run once per 10 minutes (600_000 ms)
+                    if now - getattr(self, '_last_10m_run', 0) >= 10 * 60 * 1000:
+                        for symbol in self.symbols:
+                            try:
+                                self._process_symbol_signals_10m(symbol)
+                            except Exception as e:
+                                self.logger.error(f"Error processing 10m symbol {symbol}: {e}")
+                        self._last_10m_run = now
+                    # Light sleep while waiting for 10m boundary
+                    time.sleep(1)
+                else:
+                    # Default: fine-grained processing
+                    for symbol in self.symbols:
+                        self._process_symbol_signals(symbol)
+                    # Small delay to prevent excessive CPU usage
+                    time.sleep(0.1)
                 
             except Exception as e:
                 self.logger.error(f"Error in signal loop: {e}")
@@ -157,6 +188,128 @@ class SignalEngine:
         # Check for NOBI trigger
         if abs(nobi_value) >= self.nobi_threshold:
             self._handle_nobi_trigger(symbol, nobi_value, order_book_data)
+    
+    def _process_symbol_signals_10m(self, symbol: str) -> None:
+        """
+        10-minute aggregated processing for a specific symbol.
+        This uses coarser price / kline features (from Redis klines) and a persistent-confirmation
+        (N-of-M) rule before emitting signals. Intended to be conservative and produce higher
+        win-rate, lower-frequency signals.
+        """
+        try:
+            # Fetch recent 1m klines from Redis (stored as JSON strings lpush newest first)
+            raw_klines = []
+            try:
+                raw_klines = self.redis_manager.redis_client.lrange(f"klines:{symbol}", 0, 199)
+            except Exception:
+                raw_klines = []
+            if not raw_klines:
+                return
+            
+            # Parse into chronological closes
+            closes = []
+            highs = []
+            lows = []
+            volumes = []
+            # Redis list is newest first; reverse for chronological order
+            for raw in reversed(raw_klines):
+                try:
+                    k = json.loads(raw)
+                    close = float(k.get('close') or k.get('price') or 0)
+                    high = float(k.get('high', close))
+                    low = float(k.get('low', close))
+                    volume = float(k.get('volume', 0.0))
+                    closes.append(close)
+                    highs.append(high)
+                    lows.append(low)
+                    volumes.append(volume)
+                except Exception:
+                    continue
+            
+            if len(closes) < 10:
+                # Not enough history to form a 10m view
+                return
+            
+            # Use last 10 1m candles as approximate 10m window
+            window_closes = closes[-10:]
+            window_highs = highs[-10:]
+            window_lows = lows[-10:]
+            window_vols = volumes[-10:]
+            
+            # Feature heuristics (10m)
+            ema_short = calculate_ema(window_closes, min(3, len(window_closes)))
+            ema_long = calculate_ema(closes[-30:] if len(closes) >= 30 else closes, min(10, max(3, len(closes))))
+            rsi = calculate_rsi(closes, period=14)
+            atr = calculate_atr(window_highs, window_lows, window_closes, period=min(10, len(window_closes)-1))
+            momentum = calculate_momentum(window_closes, period=5)
+            
+            # Determine directional suggestion
+            direction_suggestion = None
+            if ema_short > ema_long and momentum > 0:
+                direction_suggestion = SignalDirection.LONG
+            elif ema_short < ema_long and momentum < 0:
+                direction_suggestion = SignalDirection.SHORT
+            else:
+                # No clear direction at 10m
+                return
+            
+            # Persistent confirmation: push direction into history and require N of M agreement
+            hist = self.ten_min_history.get(symbol, [])
+            hist.append(direction_suggestion.value)
+            # Keep at most confirm_m entries
+            hist = hist[-self.confirm_m:]
+            self.ten_min_history[symbol] = hist
+            
+            same_dir_count = sum(1 for v in hist if v == direction_suggestion.value)
+            if same_dir_count < self.confirm_n:
+                # Not yet confirmed across required bars
+                return
+            
+            # Build a simple feature vector for ML if available (fallback to heuristic confidence)
+            features = []
+            try:
+                # Basic features: last NOBI if present (non-mandatory), momentum, rsi normalized, atr normalized
+                # NOBI not always available for aggregated 10m, so we skip if missing
+                # Use momentum (scaled), rsi/100, atr normalized by price
+                last_price = window_closes[-1]
+                features.append(momentum)
+                features.append(rsi / 100.0)
+                features.append(atr / last_price if last_price > 0 else 0.0)
+                # Add trend alignment placeholder (1.0 strong)
+                features.append(1.0 if ema_short > ema_long else -1.0)
+                features = np.array(features, dtype=np.float32)
+                if self.feature_scaler:
+                    features = self.feature_scaler.transform(features.reshape(1, -1))[0]
+            except Exception:
+                features = None
+            
+            # Get ML confidence if model exists
+            confidence = 0.0
+            if self.ml_model is not None and features is not None:
+                try:
+                    confidence = self._get_ml_prediction(features)
+                except Exception:
+                    confidence = 0.0
+            else:
+                # Heuristic fallback: combine momentum magnitude and normalized rsi distance from 50
+                conf = min(1.0, max(0.0, (abs(momentum) / 5.0) + (abs(rsi - 50) / 100.0)))
+                confidence = conf
+            
+            # Only publish if confidence meets threshold
+            if confidence >= self.ml_confidence_threshold:
+                signal = self._create_trading_signal(symbol, direction_suggestion, nobi_value=0.0, confidence=confidence, order_book_data={'mid_price': window_closes[-1]})
+                self._publish_signal(signal)
+                self.last_signal_time[symbol] = get_timestamp()
+                self.signals_generated += 1
+                # Update 10m metrics
+                self.ten_min_metrics[symbol]['confirmed_signals'] += 1
+                self.ten_min_metrics[symbol]['last_confirm_ts'] = get_timestamp()
+                
+                self.logger.info(f"[10m] Generated {direction_suggestion.value} signal for {symbol} - Confidence: {confidence:.3f}")
+            
+        except Exception as e:
+            self.logger.error(f"Error in 10m processing for {symbol}: {e}")
+            return
     
     def _get_latest_order_book(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
@@ -564,12 +717,22 @@ class SignalEngine:
         Returns:
             Health status information
         """
-        return {
-            'is_running': self.is_running,
-            'symbols_monitored': len(self.symbols),
-            'signals_generated': self.signals_generated,
-            'ml_model_loaded': self.ml_model is not None,
-            'feature_scaler_loaded': self.feature_scaler is not None,
-            'signals_in_queue': self.signal_queue.qsize(),
-            'market_regimes': {symbol: regime.value for symbol, regime in self.market_regimes.items()}
-        }
+        try:
+            return {
+                'is_running': self.is_running,
+                'symbols_monitored': len(self.symbols),
+                'signals_generated': self.signals_generated,
+                'ml_model_loaded': self.ml_model is not None,
+                'feature_scaler_loaded': self.feature_scaler is not None,
+                'signals_in_queue': self.signal_queue.qsize(),
+                'market_regimes': {symbol: regime.value for symbol, regime in self.market_regimes.items()},
+                # 10-minute mode indicators
+                'ten_min_mode': bool(self.use_10m_mode),
+                'ten_min_metrics': self.ten_min_metrics
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting signal engine health status: {e}")
+            return {
+                'is_running': self.is_running,
+                'symbols_monitored': len(self.symbols)
+            }
