@@ -1,19 +1,59 @@
-"""
-Decision Logger component for Helios Trading System.
+import csv
+import os
+from datetime import datetime
+from typing import Dict, Any, Optional, Callable
+from app.utils import RedisManager
 
-Subscribes to the 'trading_signals' Redis pub/sub channel and persists
-recent decision logs (signals) into a Redis list for UI/API retrieval
-and later auditing.
+class CSVDecisionLogger:
+    """
+    Logs detailed trading decisions and market state to a CSV file for analysis.
+    """
+    def __init__(self, redis_manager: Optional[RedisManager] = None, mode_resolver: Optional[Callable[[], str]] = None, log_dir: str = "logs"):
+        self.log_dir = log_dir
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        # Create a new log file for each day
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        self.filename = os.path.join(log_dir, f"decisions_{date_str}.csv")
+        
+        # Define columns
+        self.columns = [
+            "timestamp", "symbol", "price", "nobi", "rsi", 
+            "volume_ratio", "vwap_gap_pct", "ml_confidence", 
+            "decision", "reason"
+        ]
+        
+        # Initialize file with headers if it doesn't exist
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(self.columns)
 
-Key Features:
-- Works in all modes (live/public/synthetic)
-- Stores bounded list (default keep last 500)
-- Applies TTL (default 24h) so old data expires automatically
-- Lightweight subscriber thread (non-blocking to main system)
-- Simulated PnL reconstruction with implicit EXIT generation
-- Guardrails (cooldown, max positions, time/percent stops, duplicate suppression)
-- Enhanced performance metrics (profit_factor, streaks, equity-based drawdown)
-"""
+    def log_decision(self, data: Dict[str, Any]):
+        """
+        Log a single decision event.
+        
+        Args:
+            data: Dictionary containing values for all columns
+        """
+        try:
+            # Ensure file exists (handle day rollover if needed)
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            if current_date not in self.filename:
+                self.filename = os.path.join(self.log_dir, f"decisions_{current_date}.csv")
+                if not os.path.exists(self.filename):
+                    with open(self.filename, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(self.columns)
+
+            with open(self.filename, 'a', newline='') as f:
+                writer = csv.writer(f)
+                row = [data.get(col, "") for col in self.columns]
+                writer.writerow(row)
+                
+        except Exception as e:
+            print(f"Error logging decision: {e}")
 
 import json
 import logging

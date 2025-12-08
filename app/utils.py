@@ -119,6 +119,25 @@ def calculate_ema(prices: List[float], period: int) -> float:
     
     return ema
 
+def calculate_vwap(prices: List[float], volumes: List[float]) -> float:
+    """
+    Calculate Volume Weighted Average Price (VWAP).
+    
+    Args:
+        prices: List of prices
+        volumes: List of volumes
+        
+    Returns:
+        VWAP value
+    """
+    if not prices or not volumes or len(prices) != len(volumes):
+        return 0.0
+    
+    total_pv = sum(p * v for p, v in zip(prices, volumes))
+    total_v = sum(volumes)
+    
+    return total_pv / total_v if total_v > 0 else 0.0
+
 def calculate_rsi(prices: List[float], period: int = 14) -> float:
     """
     Calculate Relative Strength Index (RSI).

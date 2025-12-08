@@ -7,6 +7,7 @@ import logging
 import json
 import time
 import threading
+import base64
 from typing import Dict, Any, Optional
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -23,8 +24,45 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
         self.system_reference = system_reference
         super().__init__(*args, **kwargs)
     
+    def _check_auth(self):
+        """Check for Basic Authentication."""
+        config = get_config()
+        # Check if auth is enabled (default to false if not specified)
+        auth_enabled_str = str(config.get('dashboard', 'enabled', fallback='false')).lower()
+        auth_enabled = auth_enabled_str == 'true'
+        
+        if not auth_enabled:
+            return True
+            
+        auth_header = self.headers.get('Authorization')
+        if not auth_header:
+            return False
+            
+        try:
+            auth_type, auth_token = auth_header.split(' ', 1)
+            if auth_type.lower() != 'basic':
+                return False
+                
+            decoded = base64.b64decode(auth_token).decode('utf-8')
+            username, password = decoded.split(':', 1)
+            
+            valid_user = config.get('dashboard', 'username', fallback='admin')
+            valid_pass = config.get('dashboard', 'password', fallback='admin')
+            
+            return username == valid_user and password == valid_pass
+        except Exception:
+            return False
+
     def do_GET(self):
         """Handle GET requests."""
+        if not self._check_auth():
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="Helios Dashboard"')
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'Authentication required')
+            return
+
         try:
             parsed_path = urlparse(self.path)
 

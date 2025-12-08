@@ -47,7 +47,7 @@ class RiskManager:
         
         # Performance tracking for Kelly calculation
         self.trade_history = []
-        self.win_rate = 0.6  # Default optimistic assumption
+        self.win_rate = 0.45  # Default conservative assumption
         self.avg_win = 0.01  # Default 1% win
         self.avg_loss = 0.005  # Default 0.5% loss
         

@@ -16,8 +16,9 @@ import xgboost as xgb
 from app.models import TradingSignal, SignalDirection, OrderBookSnapshot, MarketRegime
 from app.utils import (RedisManager, calculate_nobi, calculate_ema, calculate_rsi, get_timestamp, CircularBuffer,
                        calculate_slope, classify_trend, calculate_momentum, calculate_multi_timeframe_trend,
-                       calculate_trend_alignment)
+                       calculate_trend_alignment, calculate_vwap)
 from app.config_manager import get_config
+from app.decision_logger import CSVDecisionLogger
 
 class SignalEngine:
     """
@@ -75,13 +76,16 @@ class SignalEngine:
         self.price_buffers = {symbol: CircularBuffer(100) for symbol in symbols}
         self.nobi_buffers = {symbol: CircularBuffer(50) for symbol in symbols}
         self.volume_buffers = {symbol: CircularBuffer(100) for symbol in symbols}
+        self.last_trade_ids = {} # Track last processed trade to avoid duplicates
         
         # Market regime tracking
         self.market_regimes = {symbol: MarketRegime.UNKNOWN for symbol in symbols}
-        
         # Performance tracking
         self.signals_generated = 0
         self.last_signal_time = {}
+        
+        # Decision Logger
+        self.decision_logger = CSVDecisionLogger()
         
     def start(self) -> None:
         """Start the signal generation engine."""
@@ -158,8 +162,8 @@ class SignalEngine:
                     # Default: fine-grained processing
                     for symbol in self.symbols:
                         self._process_symbol_signals(symbol)
-                    # Small delay to prevent excessive CPU usage
-                    time.sleep(0.1)
+                    # Reduced latency from 0.1s to 0.01s (10ms)
+                    time.sleep(0.01)
                 
             except Exception as e:
                 self.logger.error(f"Error in signal loop: {e}")
@@ -368,12 +372,16 @@ class SignalEngine:
         # Update NOBI buffer
         self.nobi_buffers[symbol].append(nobi_value)
         
-        # Get trade data for volume
+        # Get trade data for volume - ONLY append if it's a new trade
         trade_data = self.redis_manager.get_data(f"trade:{symbol}")
         if trade_data:
-            volume = trade_data.get('quantity', 0)
-            self.volume_buffers[symbol].append(volume)
-    
+            trade_id = trade_data.get('trade_id')
+            # Check if we already processed this trade
+            if trade_id and trade_id != self.last_trade_ids.get(symbol):
+                volume = trade_data.get('quantity', 0)
+                self.volume_buffers[symbol].append(volume)
+                self.last_trade_ids[symbol] = trade_id
+
     def _handle_nobi_trigger(self, symbol: str, nobi_value: float, order_book_data: Dict[str, Any]) -> None:
         """
         Handle NOBI trigger event - run ML filter and potentially generate signal.
@@ -387,9 +395,80 @@ class SignalEngine:
             # Determine signal direction
             direction = SignalDirection.SHORT if nobi_value > 0 else SignalDirection.LONG
             
-            # Skip if too soon since last signal for this symbol
-            if self._is_too_soon_for_signal(symbol):
-                return
+            # --- Volume-Price Strategy Optimization ---
+            # 1. Volume Spike Confirmation (Whale Tracking)
+            # We only trade if the current trade size is significantly larger than the recent average.
+            volumes = self.volume_buffers[symbol].get_latest(20)
+            current_vol = 0
+            avg_vol = 0
+            vol_ratio = 0.0
+            
+            if len(volumes) >= 5:
+                current_vol = volumes[-1]
+                # Calculate average of previous trades (excluding current)
+                avg_vol = sum(volumes[:-1]) / (len(volumes)-1) if len(volumes) > 1 else current_vol
+                vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
+                
+                # Filter: Require trade size to be at least 1.5x average (Significant interest)
+                if avg_vol > 0 and current_vol < (avg_vol * 1.5):
+                    # Log rejection
+                    self.decision_logger.log_decision({
+                        "timestamp": get_timestamp(),
+                        "symbol": symbol,
+                        "price": order_book_data.get('mid_price', 0),
+                        "nobi": nobi_value,
+                        "rsi": 0, # Not calculated here yet
+                        "volume_ratio": f"{vol_ratio:.2f}",
+                        "vwap_gap_pct": 0,
+                        "ml_confidence": 0,
+                        "decision": "REJECT",
+                        "reason": "Low Volume"
+                    })
+                    return
+
+            # 2. VWAP Confirmation (Fair Price)
+            prices = self.price_buffers[symbol].get_latest(20)
+            vwap_gap = 0.0
+            
+            # Ensure we have matching data length for VWAP calculation
+            min_len = min(len(prices), len(volumes))
+            if min_len >= 5:
+                vwap = calculate_vwap(prices[-min_len:], volumes[-min_len:])
+                current_price = prices[-1]
+                if vwap > 0:
+                    vwap_gap = ((current_price - vwap) / vwap) * 100
+                
+                # Filter: Avoid buying if price is significantly above VWAP (Overextended)
+                # Filter: Avoid selling if price is significantly below VWAP (Oversold)
+                if direction == SignalDirection.LONG and current_price > vwap * 1.005: # 0.5% buffer
+                    self.decision_logger.log_decision({
+                        "timestamp": get_timestamp(),
+                        "symbol": symbol,
+                        "price": current_price,
+                        "nobi": nobi_value,
+                        "rsi": 0,
+                        "volume_ratio": f"{vol_ratio:.2f}",
+                        "vwap_gap_pct": f"{vwap_gap:.4f}",
+                        "ml_confidence": 0,
+                        "decision": "REJECT",
+                        "reason": "Price > VWAP (Overextended)"
+                    })
+                    return
+                if direction == SignalDirection.SHORT and current_price < vwap * 0.995: # 0.5% buffer
+                    self.decision_logger.log_decision({
+                        "timestamp": get_timestamp(),
+                        "symbol": symbol,
+                        "price": current_price,
+                        "nobi": nobi_value,
+                        "rsi": 0,
+                        "volume_ratio": f"{vol_ratio:.2f}",
+                        "vwap_gap_pct": f"{vwap_gap:.4f}",
+                        "ml_confidence": 0,
+                        "decision": "REJECT",
+                        "reason": "Price < VWAP (Oversold)"
+                    })
+                    return
+            # ------------------------------------------
             
             # Create feature vector for ML model
             features = self._create_feature_vector(symbol, nobi_value, order_book_data)
@@ -404,6 +483,36 @@ class SignalEngine:
                 signal = self._create_trading_signal(symbol, direction, nobi_value, confidence, order_book_data)
                 self._publish_signal(signal)
                 self.last_signal_time[symbol] = get_timestamp()
+                self.signals_generated += 1
+                
+                self.decision_logger.log_decision({
+                    "timestamp": get_timestamp(),
+                    "symbol": symbol,
+                    "price": order_book_data.get('mid_price', 0),
+                    "nobi": nobi_value,
+                    "rsi": 0,
+                    "volume_ratio": f"{vol_ratio:.2f}",
+                    "vwap_gap_pct": f"{vwap_gap:.4f}",
+                    "ml_confidence": f"{confidence:.3f}",
+                    "decision": f"SIGNAL_{direction.value}",
+                    "reason": "ML Confidence Met"
+                })
+                
+                self.logger.info(f"Generated {direction.value} signal for {symbol} - "
+                               f"NOBI: {nobi_value:.4f}, Confidence: {confidence:.3f}")
+            else:
+                self.decision_logger.log_decision({
+                    "timestamp": get_timestamp(),
+                    "symbol": symbol,
+                    "price": order_book_data.get('mid_price', 0),
+                    "nobi": nobi_value,
+                    "rsi": 0,
+                    "volume_ratio": f"{vol_ratio:.2f}",
+                    "vwap_gap_pct": f"{vwap_gap:.4f}",
+                    "ml_confidence": f"{confidence:.3f}",
+                    "decision": "REJECT",
+                    "reason": f"Low ML Confidence ({confidence:.3f})"
+                })
                 self.signals_generated += 1
                 
                 self.logger.info(f"Generated {direction.value} signal for {symbol} - "
