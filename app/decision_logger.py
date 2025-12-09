@@ -21,7 +21,9 @@ class CSVDecisionLogger:
         self.columns = [
             "timestamp", "symbol", "price", "nobi", "rsi", 
             "volume_ratio", "vwap_gap_pct", "ml_confidence", 
-            "decision", "reason"
+            "decision", "reason", "entry_price", "stop_loss", 
+            "take_profit", "realized_pnl", "position_size", 
+            "capital_used_usd", "mode"
         ]
         
         # Initialize file with headers if it doesn't exist
@@ -49,11 +51,27 @@ class CSVDecisionLogger:
 
             with open(self.filename, 'a', newline='') as f:
                 writer = csv.writer(f)
+                # Handle missing keys gracefully
                 row = [data.get(col, "") for col in self.columns]
                 writer.writerow(row)
                 
         except Exception as e:
             print(f"Error logging decision: {e}")
+
+def clear_daily_log(log_dir: str = "logs"):
+    """Clear the current day's log file on startup."""
+    try:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        filename = os.path.join(log_dir, f"decisions_{date_str}.csv")
+        
+        if os.path.exists(filename):
+            os.remove(filename)
+            print(f"Cleared daily log file: {filename}")
+    except Exception as e:
+        print(f"Error clearing daily log: {e}")
 
 import json
 import logging
@@ -175,6 +193,9 @@ class DecisionLogger:
 
         # Lock for position / summary updates
         self._lock = threading.RLock()
+        
+        # CSV Logger for postmortem analysis
+        self.csv_logger = CSVDecisionLogger(log_dir="logs")
 
     # ------------------------------------------------------------------------------------
     # Lifecycle
@@ -350,8 +371,8 @@ class DecisionLogger:
                 
                 # Check daily loss limit
                 if self._is_daily_loss_limit_reached():
-                    self.logger.warning(f"Daily loss limit reached ({self.daily_loss_limit_pct}% = ${abs(self._daily_pnl):.2f})")
-                    return
+                    self.logger.warning(f"Daily loss limit reached ({self.daily_loss_limit_pct}% = ${abs(self._daily_pnl):.2f}) - Logging only, trading simulation continues")
+                    # return  <-- Disabled to keep trading in simulation
                 
                 # ENTRY directions
                 if direction in (SignalDirection.LONG, SignalDirection.SHORT):
@@ -708,6 +729,9 @@ class DecisionLogger:
     def _push_decision(self, decision_dict: Dict[str, Any]) -> None:
         """Push a single decision record to Redis list with trimming & TTL."""
         try:
+            # Log to CSV for postmortem
+            self.csv_logger.log_decision(decision_dict)
+            
             pipe = self.redis_manager.redis_client.pipeline()
             pipe.lpush(self.list_key, json.dumps(decision_dict))
             pipe.ltrim(self.list_key, 0, self.max_entries - 1)

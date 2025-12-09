@@ -27,7 +27,7 @@ from app.monitoring_agent import MonitoringAgent
 from app.reddit_ingestor import RedditIngestor
 from app.performance_tracker import PerformanceTracker
 from app.health_dashboard import HealthDashboard
-from app.decision_logger import DecisionLogger
+from app.decision_logger import DecisionLogger, clear_daily_log
 
 class HeliosSystem:
     """
@@ -79,6 +79,9 @@ class HeliosSystem:
             
             # Create logs directory
             os.makedirs('logs', exist_ok=True)
+            
+            # Clear daily log on startup
+            clear_daily_log()
             
             # Set up logging
             log_level = self.config.get('system', 'log_level', str)
