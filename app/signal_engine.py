@@ -391,6 +391,10 @@ class SignalEngine:
             nobi_value: NOBI value that triggered
             order_book_data: Order book data
         """
+        # Prevent signal spamming
+        if self._is_too_soon_for_signal(symbol):
+            return
+
         try:
             # Determine signal direction
             direction = SignalDirection.SHORT if nobi_value > 0 else SignalDirection.LONG

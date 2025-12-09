@@ -36,7 +36,8 @@ def setup_logging(log_level: str = "INFO") -> None:
         handlers=[
             logging.FileHandler('logs/helios.log'),
             logging.StreamHandler()
-        ]
+        ],
+        force=True
     )
 
 def get_timestamp() -> int:

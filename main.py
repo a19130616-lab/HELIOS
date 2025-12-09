@@ -77,13 +77,13 @@ class HeliosSystem:
             # Initialize configuration
             self.config = init_config()
             
+            # Create logs directory
+            os.makedirs('logs', exist_ok=True)
+            
             # Set up logging
             log_level = self.config.get('system', 'log_level', str)
             setup_logging(log_level)
             self.logger = logging.getLogger(__name__)
-            
-            # Create logs directory
-            os.makedirs('logs', exist_ok=True)
             
             self.logger.info("Starting Helios High-Frequency Trading System")
             self.logger.info("=" * 50)
