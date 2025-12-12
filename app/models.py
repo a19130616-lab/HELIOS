@@ -100,6 +100,7 @@ class DecisionLog:
     notes: Optional[str] = None
     realized_pnl: Optional[float] = None     # Populated on EXIT_* events
     position_size: Optional[float] = None    # Size used for PnL calc (simulated/public)
+    commission: Optional[float] = None       # Commission fee paid (simulated or real)
 
     def __post_init__(self):
         if not 0 <= self.confidence <= 1:
@@ -124,6 +125,7 @@ class DecisionLog:
             "notes": self.notes,
             "realized_pnl": self.realized_pnl,
             "position_size": self.position_size,
+            "commission": self.commission,
         }
 
 @dataclass

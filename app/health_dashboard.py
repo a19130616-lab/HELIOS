@@ -10,7 +10,7 @@ import threading
 import base64
 from typing import Dict, Any, Optional
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from app.utils import RedisManager, get_timestamp
@@ -322,8 +322,15 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             if need_fallback:
                 sim_summary = self.redis_manager.get_data('simulated_pnl_summary')
                 if sim_summary:
+                    # DecisionLogger stores Net PnL in 'total_pnl'.
+                    # We reconstruct Gross PnL for consistency with PerformanceTracker.
+                    net_val = float(sim_summary.get('total_pnl', 0.0))
+                    fees_val = float(sim_summary.get('total_fees', 0.0))
+                    
                     performance = {
-                        'total_pnl': sim_summary.get('total_pnl', 0.0),
+                        'total_pnl': net_val + fees_val,  # Gross PnL
+                        'total_fees': fees_val,
+                        'net_pnl': net_val,
                         'total_trades': sim_summary.get('total_trades', 0),
                         'win_rate': sim_summary.get('win_rate', 0.0),
                         'max_drawdown_pct': sim_summary.get('max_drawdown_pct', 0.0),
@@ -390,10 +397,13 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     'age_ms': age_ms
                 })
 
-            realized = float(performance.get('total_pnl', 0.0)) if performance else 0.0
-            performance.setdefault('total_pnl', realized)
+            realized_gross = float(performance.get('total_pnl', 0.0)) if performance else 0.0
+            # Use net_pnl for equity calculation if available, otherwise fallback to gross (legacy behavior)
+            realized_net = float(performance.get('net_pnl', realized_gross))
+            
+            performance.setdefault('total_pnl', realized_gross)
             performance['unrealized_pnl'] = unrealized_total
-            performance['total_equity_pnl'] = realized + unrealized_total
+            performance['total_equity_pnl'] = realized_net + unrealized_total
             performance['open_positions_count'] = len(enriched_positions)
             performance['open_positions'] = enriched_positions
             # Derive simulated account value from starting balance (config) + equity PnL
@@ -413,6 +423,16 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     performance['leverage'] = sim_summary.get('leverage', 1.0)
                     performance['daily_pnl'] = sim_summary.get('daily_pnl', 0.0)
                     performance['daily_loss_limit'] = sim_summary.get('daily_loss_limit', 0.0)
+            
+            # Final fallback to config if still missing
+            if 'futures_mode' not in performance:
+                try:
+                    cfg = get_config()
+                    performance['futures_mode'] = cfg.get('simulation', 'futures_mode', bool, False)
+                    performance['leverage'] = cfg.get('simulation', 'leverage', float, 1.0)
+                    performance['daily_loss_limit'] = cfg.get('simulation', 'daily_loss_limit_pct', float, 5.0)
+                except Exception:
+                    pass
 
             return {
                 'timestamp': get_timestamp(),
@@ -1215,8 +1235,10 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
 
             const perf = data.performance;
             const realized = perf.total_pnl || 0;
+            const fees = perf.total_fees || 0;
+            const netPnl = perf.net_pnl !== undefined ? perf.net_pnl : (realized - fees);
             const unrealized = perf.unrealized_pnl || 0;
-            const equity = perf.total_equity_pnl !== undefined ? perf.total_equity_pnl : (realized + unrealized);
+            const equity = perf.total_equity_pnl !== undefined ? perf.total_equity_pnl : (netPnl + unrealized);
             const accountValue = perf.account_value !== undefined ? perf.account_value : ((perf.starting_balance || 10000) + equity);
             
             // Futures trading info
@@ -1246,6 +1268,14 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     <span class="metric-label">Today's PnL:</span>
                     <span class="metric-value ${dailyPnL >= 0 ? 'profit' : 'loss'}">$${dailyPnL.toFixed(2)}</span>
                 </div>
+                <div class="metric-row">
+                    <span class="metric-label">Total Fees:</span>
+                    <span class="metric-value" style="color: #f85149;">-$${fees.toFixed(2)}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Net PnL:</span>
+                    <span class="metric-value ${netPnl >= 0 ? 'profit' : 'loss'}">$${netPnl.toFixed(2)}</span>
+                </div>
             `;
             
             // Show daily limit warning if close
@@ -1271,7 +1301,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     <span class="metric-value">${perf.win_rate ? (perf.win_rate).toFixed(1) + '%' : '0%'}</span>
                 </div>
                 <div class="metric-row">
-                    <span class="metric-label">Realized PnL:</span>
+                    <span class="metric-label">Gross Realized PnL:</span>
                     <span class="metric-value ${realized >= 0 ? 'profit' : 'loss'}">$${realized.toFixed(2)}</span>
                 </div>
                 <div class="metric-row">
@@ -1306,7 +1336,9 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                         <tr>
                             <th>Symbol</th>
                             <th>Side</th>
-                            <th>PnL</th>
+                            <th>Gross PnL</th>
+                            <th>Fee</th>
+                            <th>Net PnL</th>
                             <th>Exit Reason</th>
                         </tr>
                     </thead>
@@ -1315,11 +1347,18 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
     
             data.recent_trades.slice(-5).forEach(trade => {
                 const pnlClass = trade.pnl >= 0 ? 'profit' : 'loss';
+                const netPnlVal = trade.net_pnl !== undefined ? trade.net_pnl : trade.pnl;
+                const netPnlClass = netPnlVal >= 0 ? 'profit' : 'loss';
+                const fee = trade.commission !== undefined ? `$${trade.commission.toFixed(4)}` : '-';
+                const netPnl = trade.net_pnl !== undefined ? `$${trade.net_pnl.toFixed(2)}` : '-';
+
                 tableHtml += `
                     <tr>
                         <td>${trade.symbol}</td>
                         <td>${trade.side}</td>
                         <td class="${pnlClass}">$${trade.pnl.toFixed(2)}</td>
+                        <td>${fee}</td>
+                        <td class="${netPnlClass}">${netPnl}</td>
                         <td>${trade.exit_reason}</td>
                     </tr>
                 `;
@@ -1491,6 +1530,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                             <th>Notional</th>
                             <th>Capital</th>
                             <th>PnL</th>
+                            <th>Fee</th>
                             <th>Mode</th>
                             <th>Reason</th>
                         </tr>
@@ -1512,6 +1552,8 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     const dirDisplay = (dir.startsWith('EXIT_') ? 'EXIT' : dir);
                     const notional = d.position_value_usd ? ('$' + Number(d.position_value_usd).toFixed(2)) : '';
                     const capital = d.capital_used_usd ? ('$' + Number(d.capital_used_usd).toFixed(2)) : '';
+                    const fee = d.commission !== null && d.commission !== undefined ? '$' + Number(d.commission).toFixed(4) : '';
+
                     html += `
                         <tr>
                             <td>${t}</td>
@@ -1522,6 +1564,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                             <td>${notional}</td>
                             <td>${capital}</td>
                             <td class="${pnlClass}">${pnl !== '' ? ('$' + pnl.toFixed(2)) : ''}</td>
+                            <td>${fee}</td>
                             <td>${d.mode}</td>
                             <td title="${d.reason || ''}">${d.reason ? d.reason.substring(0,18) : ''}</td>
                         </tr>
@@ -1891,7 +1934,8 @@ class HealthDashboard:
                 )
             
             # Create and start server
-            self.server = HTTPServer(('0.0.0.0', self.port), handler_factory)
+            # Use ThreadingHTTPServer to handle multiple concurrent requests (prevents blocking)
+            self.server = ThreadingHTTPServer(('0.0.0.0', self.port), handler_factory)
             self.server_thread = threading.Thread(target=self._run_server, daemon=True)
             self.server_thread.start()
             

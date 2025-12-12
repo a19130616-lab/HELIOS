@@ -78,7 +78,7 @@ class RiskManager:
     
     def get_position_size(self, symbol: str, entry_price: float, stop_loss: float) -> float:
         """
-        Calculate optimal position size using Fractional Kelly Criterion.
+        Calculate position size using fixed 1% margin allocation.
         
         Args:
             symbol: Trading symbol
@@ -97,41 +97,28 @@ class RiskManager:
             
             available_balance = account_info.available_balance
             
-            # Calculate Kelly percentage
-            kelly_pct = kelly_criterion(self.win_rate, self.avg_win, self.avg_loss)
+            # Fixed 1% margin allocation
+            margin_pct = 0.01
+            margin_amount = available_balance * margin_pct
             
-            # Apply fraction and safety limits
-            fractional_kelly = kelly_pct * self.kelly_fraction
+            # Calculate total position value (Notional)
+            # Notional = Margin * Leverage
+            position_value = margin_amount * self.leverage
             
-            # Limit to maximum 10% of balance per trade
-            max_risk_pct = min(fractional_kelly, 0.10)
-            
-            # Calculate risk amount
-            risk_amount = available_balance * max_risk_pct
-            
-            # Calculate position size based on stop loss distance
-            if entry_price == 0 or stop_loss == 0 or entry_price == stop_loss:
-                return 0.0
-            
-            stop_distance = abs(entry_price - stop_loss)
-            stop_distance_pct = stop_distance / entry_price
-            
-            # Position size calculation
-            position_value = risk_amount / stop_distance_pct
+            # Calculate quantity
             position_size = position_value / entry_price
             
-            # Apply leverage
-            leveraged_size = position_size * self.leverage
+            # Safety check - ensure we don't exceed account limits (use max 95% of available for safety)
+            max_position_value = available_balance * self.leverage * 0.95
+            if position_size * entry_price > max_position_value:
+                self.logger.warning(f"Position size {position_size} exceeds max safe limit, capping.")
+                position_size = max_position_value / entry_price
             
-            # Safety check - ensure we don't exceed account limits
-            max_position_value = available_balance * self.leverage * 0.8  # 80% of max
-            if leveraged_size * entry_price > max_position_value:
-                leveraged_size = max_position_value / entry_price
+            self.logger.info(f"Position sizing for {symbol}: Balance={available_balance:.2f}, "
+                           f"Margin={margin_amount:.2f} (1%), Leverage={self.leverage}, "
+                           f"Size={position_size:.6f}")
             
-            self.logger.info(f"Position sizing for {symbol}: Kelly={kelly_pct:.3f}, "
-                           f"Fractional={fractional_kelly:.3f}, Size={leveraged_size:.6f}")
-            
-            return leveraged_size
+            return position_size
             
         except Exception as e:
             self.logger.error(f"Error calculating position size: {e}")

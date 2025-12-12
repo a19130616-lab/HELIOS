@@ -405,6 +405,19 @@ class ExecutionManager:
             avg_price = float(order['avgPrice'])
             
             self.logger.info(f"Order filled: {symbol} {filled_qty} @ {avg_price}")
+
+            # Fetch commission info
+            commission = 0.0
+            commission_asset = "USDT"
+            try:
+                # Fetch trades associated with this order to get commission
+                trades = self.api_client.get_account_trades(symbol=symbol, orderId=order_id)
+                for trade in trades:
+                    commission += float(trade.get('commission', 0.0))
+                    commission_asset = trade.get('commissionAsset', commission_asset)
+                self.logger.info(f"Order {order_id} commission: {commission} {commission_asset}")
+            except Exception as e:
+                self.logger.error(f"Error fetching commission for order {order_id}: {e}")
             
             # Add position to risk manager
             self.risk_manager.add_position(
@@ -420,7 +433,7 @@ class ExecutionManager:
                 del self.pending_signals[symbol]
             
             # Log execution
-            self._log_execution(symbol, order_info['order_side'], filled_qty, avg_price, "FILLED")
+            self._log_execution(symbol, order_info['order_side'], filled_qty, avg_price, "FILLED", commission, commission_asset)
             
         except Exception as e:
             self.logger.error(f"Error handling order fill {order_id}: {e}")
@@ -538,12 +551,23 @@ class ExecutionManager:
             )
             
             self.logger.warning(f"Stop loss executed for {symbol}: {order}")
+
+            # Fetch commission
+            commission = 0.0
+            commission_asset = "USDT"
+            try:
+                trades = self.api_client.get_account_trades(symbol=symbol, orderId=order['orderId'])
+                for trade in trades:
+                    commission += float(trade.get('commission', 0.0))
+                    commission_asset = trade.get('commissionAsset', commission_asset)
+            except Exception as e:
+                self.logger.error(f"Error fetching commission for SL {symbol}: {e}")
             
             # Remove position from risk manager
             self.risk_manager.remove_position(symbol, position.current_price, "STOP_LOSS")
             
             # Log execution
-            self._log_execution(symbol, position.side, quantity, position.current_price, "STOP_LOSS")
+            self._log_execution(symbol, position.side, quantity, position.current_price, "STOP_LOSS", commission, commission_asset)
             
         except Exception as e:
             self.logger.error(f"Error executing stop loss for {symbol}: {e}")
@@ -618,7 +642,7 @@ class ExecutionManager:
             self.logger.error(f"Error formatting price for {symbol}: {e}")
             return format_price(price)
     
-    def _log_execution(self, symbol: str, side: OrderSide, quantity: float, price: float, type: str) -> None:
+    def _log_execution(self, symbol: str, side: OrderSide, quantity: float, price: float, type: str, commission: float = 0.0, commission_asset: str = "USDT") -> None:
         """
         Log trade execution.
         
@@ -628,6 +652,8 @@ class ExecutionManager:
             quantity: Execution quantity
             price: Execution price
             type: Execution type
+            commission: Commission paid
+            commission_asset: Asset commission was paid in
         """
         execution_data = {
             'symbol': symbol,
@@ -635,6 +661,8 @@ class ExecutionManager:
             'quantity': quantity,
             'price': price,
             'type': type,
+            'commission': commission,
+            'commission_asset': commission_asset,
             'timestamp': get_timestamp()
         }
         

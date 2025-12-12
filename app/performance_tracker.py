@@ -29,6 +29,8 @@ class TradeRecord:
     pnl_percentage: float
     duration_seconds: int
     exit_reason: str
+    commission: float = 0.0
+    net_pnl: float = 0.0
     sentiment_score: Optional[float] = None
     trend_score: Optional[float] = None
 
@@ -40,6 +42,8 @@ class PerformanceMetrics:
     losing_trades: int
     win_rate: float
     total_pnl: float
+    total_fees: float
+    net_pnl: float
     total_pnl_percentage: float
     average_win: float
     average_loss: float
@@ -117,6 +121,8 @@ class PerformanceTracker:
             losing_trades=0,
             win_rate=0.0,
             total_pnl=0.0,
+            total_fees=0.0,
+            net_pnl=0.0,
             total_pnl_percentage=0.0,
             average_win=0.0,
             average_loss=0.0,
@@ -226,6 +232,12 @@ class PerformanceTracker:
                     pnl = (entry_price - exit_price) * quantity
                     pnl_pct = (entry_price - exit_price) / exit_price
                 
+                # Calculate Fees and Net PnL
+                entry_commission = float(entry_data.get('commission', 0.0))
+                exit_commission = float(trade_data.get('commission', 0.0))
+                total_commission = entry_commission + exit_commission
+                net_pnl = pnl - total_commission
+
                 # Create trade record
                 trade_record = TradeRecord(
                     symbol=symbol,
@@ -238,7 +250,9 @@ class PerformanceTracker:
                     pnl=pnl,
                     pnl_percentage=pnl_pct * 100,
                     duration_seconds=(trade_data['timestamp'] - entry_data['timestamp']) // 1000,
-                    exit_reason=trade_data['type']
+                    exit_reason=trade_data['type'],
+                    commission=total_commission,
+                    net_pnl=net_pnl
                 )
                 
                 # Add to records
@@ -306,7 +320,7 @@ class PerformanceTracker:
             if exit_date not in self.daily_pnl:
                 self.daily_pnl[exit_date] = 0.0
             
-            self.daily_pnl[exit_date] += trade_record.pnl
+            self.daily_pnl[exit_date] += trade_record.net_pnl
             
         except Exception as e:
             self.logger.error(f"Error updating daily PnL: {e}")
@@ -323,8 +337,8 @@ class PerformanceTracker:
             current_time = get_timestamp()
             
             # Estimate portfolio value (this would be replaced with actual account value)
-            total_pnl = sum(record.pnl for record in self.trade_records)
-            estimated_value = 10000 + total_pnl  # Assuming $10k starting capital
+            total_net_pnl = sum(record.net_pnl for record in self.trade_records)
+            estimated_value = 10000 + total_net_pnl  # Assuming $10k starting capital
             
             # Update tracking
             self.portfolio_value_history.append((current_time, estimated_value))
@@ -435,10 +449,10 @@ class PerformanceTracker:
         Returns:
             Performance metrics
         """
-        if len(self.trade_records) == 0:
+        if not self.trade_records:
             return PerformanceMetrics(
                 total_trades=0, winning_trades=0, losing_trades=0, win_rate=0.0,
-                total_pnl=0.0, total_pnl_percentage=0.0, average_win=0.0, average_loss=0.0,
+                total_pnl=0.0, total_fees=0.0, net_pnl=0.0, total_pnl_percentage=0.0, average_win=0.0, average_loss=0.0,
                 largest_win=0.0, largest_loss=0.0, profit_factor=0.0, sharpe_ratio=0.0,
                 max_drawdown=0.0, current_drawdown=0.0, average_trade_duration=0.0,
                 trades_per_day=0.0, start_time=self.start_time, end_time=get_timestamp()
@@ -454,6 +468,8 @@ class PerformanceTracker:
         
         # PnL metrics
         total_pnl = sum(t.pnl for t in self.trade_records)
+        total_fees = sum(t.commission for t in self.trade_records)
+        net_pnl = total_pnl - total_fees
         total_pnl_percentage = sum(t.pnl_percentage for t in self.trade_records)
         
         # Win/Loss averages
@@ -497,6 +513,8 @@ class PerformanceTracker:
             losing_trades=losing_trades,
             win_rate=win_rate,
             total_pnl=total_pnl,
+            total_fees=total_fees,
+            net_pnl=net_pnl,
             total_pnl_percentage=total_pnl_percentage,
             average_win=average_win,
             average_loss=average_loss,
@@ -511,6 +529,7 @@ class PerformanceTracker:
             start_time=self.start_time,
             end_time=get_timestamp()
         )
+
     
     def _calculate_drawdown(self) -> Tuple[float, float]:
         """

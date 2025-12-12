@@ -364,6 +364,7 @@ class DecisionLogger:
 
             realized_pnl: Optional[float] = None
             pos_size: Optional[float] = None
+            total_fees: Optional[float] = None
 
             with self._lock:
                 # Check and reset daily PnL if new day
@@ -419,13 +420,20 @@ class DecisionLogger:
                         entry_value = e_price * pos_size
                         exit_value = entry_price * pos_size
                         fee_rate = self.taker_fee_pct / 100.0
-                        total_fees = (entry_value + exit_value) * fee_rate
                         
-                        realized = base_pnl - total_fees
+                        entry_fee = entry_value * fee_rate
+                        exit_fee = exit_value * fee_rate
+                        total_fees = entry_fee + exit_fee
+                        
+                        # We already deducted entry_fee from summary at entry time.
+                        # So we only deduct exit_fee and add gross_pnl now.
+                        # realized_impact = base_pnl - exit_fee
+                        
+                        realized_net_trade = base_pnl - total_fees
                         
                         self._open_positions.pop(symbol, None)
-                        self._update_simulated_summary(realized)
-                        self._record_exit(symbol, realized)
+                        self._update_simulated_summary(base_pnl - exit_fee, commission=exit_fee, is_trade_close=True)
+                        self._record_exit(symbol, realized_net_trade)
                         exit_decision = DecisionLog(
                             symbol=symbol,
                             direction=exit_dir,
@@ -435,8 +443,9 @@ class DecisionLogger:
                             entry_price=entry_price,  # exit price context
                             mode=mode,
                             reason="implicit_exit_opposite_signal",
-                            realized_pnl=realized,
+                            realized_pnl=realized_net_trade,
                             position_size=pos_size,
+                            commission=total_fees,
                         )
                         # Augment decision with USD notional / capital used for dashboard visibility
                         dec_dict = exit_decision.to_dict()
@@ -457,6 +466,14 @@ class DecisionLogger:
                             effective_capital = self.capital_per_trade * self.leverage
                         size = effective_capital / entry_price
                     pos_size = size
+
+                    # Calculate entry fee for reporting
+                    entry_value = entry_price * pos_size
+                    fee_rate = self.taker_fee_pct / 100.0
+                    entry_fee = entry_value * fee_rate
+                    
+                    # Deduct entry fee from summary immediately
+                    self._update_simulated_summary(-entry_fee, commission=entry_fee, is_trade_close=False)
 
                     # Open / overwrite
                     self._open_positions[symbol] = {
@@ -492,12 +509,15 @@ class DecisionLogger:
                             exit_value = entry_price * pos_size
                             # Use taker fee for market orders (conservative estimate)
                             fee_rate = self.taker_fee_pct / 100.0
-                            total_fees = (entry_value + exit_value) * fee_rate
+                            
+                            entry_fee = entry_value * fee_rate
+                            exit_fee = exit_value * fee_rate
+                            total_fees = entry_fee + exit_fee
                             
                             realized_pnl = base_pnl - total_fees
                             
                             self._open_positions.pop(symbol, None)
-                            self._update_simulated_summary(realized_pnl)
+                            self._update_simulated_summary(base_pnl - exit_fee, commission=exit_fee, is_trade_close=True)
                             self._record_exit(symbol, realized_pnl)
                     # Orphan EXIT otherwise just logs
 
@@ -517,6 +537,7 @@ class DecisionLogger:
                 position_size=pos_size if pos_size is not None else (
                     self.position_size if direction in (SignalDirection.LONG, SignalDirection.SHORT) else None
                 ),
+                commission=entry_fee if direction in (SignalDirection.LONG, SignalDirection.SHORT) else total_fees,
             )
     
             decision_dict = decision.to_dict()
@@ -568,12 +589,15 @@ class DecisionLogger:
             entry_value = entry_price * size
             exit_value = exit_price * size
             fee_rate = self.taker_fee_pct / 100.0
-            total_fees = (entry_value + exit_value) * fee_rate
+            
+            entry_fee = entry_value * fee_rate
+            exit_fee = exit_value * fee_rate
+            total_fees = entry_fee + exit_fee
             
             realized = base_pnl - total_fees
             
             self._open_positions.pop(symbol, None)
-            self._update_simulated_summary(realized)
+            self._update_simulated_summary(base_pnl - exit_fee, commission=exit_fee, is_trade_close=True)
             self._record_exit(symbol, realized)
 
         exit_decision = DecisionLog(
@@ -587,6 +611,7 @@ class DecisionLogger:
             reason=reason,
             realized_pnl=realized,
             position_size=size,
+            commission=total_fees,
         )
         # Augment with USD notional for dashboard
         ed = exit_decision.to_dict()
@@ -619,7 +644,7 @@ class DecisionLogger:
             "pnl": realized_pnl,
         }
 
-    def _update_simulated_summary(self, realized_pnl: Optional[float]) -> None:
+    def _update_simulated_summary(self, realized_pnl: Optional[float], commission: float = 0.0, is_trade_close: bool = True) -> None:
         """Update aggregated simulated PnL summary in Redis on each realized exit.
 
         Drawdown baseline fix: equity = starting_balance + total_pnl
@@ -636,23 +661,29 @@ class DecisionLogger:
             with self._lock:
                 summary = self.redis_manager.get_data(key) or {}
                 total_pnl = float(summary.get("total_pnl", 0.0)) + realized_pnl
-                total_trades = int(summary.get("total_trades", 0)) + 1
+                total_fees = float(summary.get("total_fees", 0.0)) + commission
+                
+                # Only update trade counts and streaks if this is a trade close
+                total_trades = int(summary.get("total_trades", 0))
                 wins = int(summary.get("wins", 0))
                 losses = int(summary.get("losses", 0))
-                if realized_pnl >= 0:
-                    wins += 1
-                    self._current_win_streak += 1
-                    self._sum_wins += realized_pnl
-                    self._current_loss_streak = 0
-                    if self._current_win_streak > self._max_win_streak:
-                        self._max_win_streak = self._current_win_streak
-                else:
-                    losses += 1
-                    self._current_loss_streak += 1
-                    self._sum_losses += realized_pnl  # negative
-                    self._current_win_streak = 0
-                    if self._current_loss_streak > self._max_loss_streak:
-                        self._max_loss_streak = self._current_loss_streak
+                
+                if is_trade_close:
+                    total_trades += 1
+                    if realized_pnl >= 0:
+                        wins += 1
+                        self._current_win_streak += 1
+                        self._sum_wins += realized_pnl
+                        self._current_loss_streak = 0
+                        if self._current_win_streak > self._max_win_streak:
+                            self._max_win_streak = self._current_win_streak
+                    else:
+                        losses += 1
+                        self._current_loss_streak += 1
+                        self._sum_losses += realized_pnl  # negative
+                        self._current_win_streak = 0
+                        if self._current_loss_streak > self._max_loss_streak:
+                            self._max_loss_streak = self._current_loss_streak
 
                 # Equity tracking
                 equity = self.starting_balance + total_pnl
@@ -676,6 +707,7 @@ class DecisionLogger:
 
                 new_summary = {
                     "total_pnl": total_pnl,
+                    "total_fees": total_fees,
                     "total_trades": total_trades,
                     "wins": wins,
                     "losses": losses,
