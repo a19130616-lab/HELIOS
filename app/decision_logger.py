@@ -158,6 +158,17 @@ class DecisionLogger:
         self.maker_fee_pct: float = g("simulation", "maker_fee_pct", float, 0.02)
         self.taker_fee_pct: float = g("simulation", "taker_fee_pct", float, 0.04)
         
+        # Trading Mode Logic
+        self.trading_mode: str = g("simulation", "mode", str, "HF_MARKET")
+        
+        # Apply Mode Overrides
+        if "LF" in self.trading_mode:
+            # Low Frequency Mode - Increase cooldowns significantly
+            # 15 minutes entry cooldown, 30 minutes loss cooldown
+            self.cooldown_ms = max(self.cooldown_ms, 900000)
+            self.loss_cooldown_ms = max(self.loss_cooldown_ms, 1800000)
+            logging.getLogger(__name__).info(f"Low Frequency Mode ({self.trading_mode}) active: Cooldowns increased to {self.cooldown_ms}ms / {self.loss_cooldown_ms}ms")
+
         # Daily loss limit (for small capital protection)
         self.daily_loss_limit_pct: float = g("simulation", "daily_loss_limit_pct", float, 5.0)
         self.max_drawdown_alert_pct: float = g("simulation", "max_drawdown_alert_pct", float, 15.0)
@@ -334,6 +345,35 @@ class DecisionLogger:
                 return True
         return False
 
+    def _get_fee_rate(self, order_type: str) -> float:
+        """
+        Calculate fee rate based on trading mode and order type.
+        
+        Args:
+            order_type: "ENTRY", "EXIT_NORMAL", "EXIT_STOP", "EXIT_TIME"
+            
+        Returns:
+            Fee rate as a decimal (e.g. 0.0004 for 0.04%)
+        """
+        # Default to Taker Fee (Market Order)
+        fee_pct = self.taker_fee_pct
+        
+        # Check for Limit Order Modes
+        if "LIMIT" in self.trading_mode:
+            if order_type == "ENTRY":
+                fee_pct = self.maker_fee_pct
+            elif order_type == "EXIT_NORMAL":
+                # Take Profit or Signal Exit -> Limit Order
+                fee_pct = self.maker_fee_pct
+            elif order_type == "EXIT_STOP":
+                # Hard Stop Loss -> Market Order (Taker)
+                fee_pct = self.taker_fee_pct
+            elif order_type == "EXIT_TIME":
+                # Time Exit -> Market Order (Taker) to ensure exit
+                fee_pct = self.taker_fee_pct
+                
+        return fee_pct / 100.0
+
     # ------------------------------------------------------------------------------------
     # Signal Handling
     # ------------------------------------------------------------------------------------
@@ -419,10 +459,12 @@ class DecisionLogger:
                         # Calculate and deduct trading fees
                         entry_value = e_price * pos_size
                         exit_value = entry_price * pos_size
-                        fee_rate = self.taker_fee_pct / 100.0
                         
-                        entry_fee = entry_value * fee_rate
-                        exit_fee = exit_value * fee_rate
+                        entry_fee_rate = self._get_fee_rate("ENTRY")
+                        exit_fee_rate = self._get_fee_rate("EXIT_NORMAL")
+                        
+                        entry_fee = entry_value * entry_fee_rate
+                        exit_fee = exit_value * exit_fee_rate
                         total_fees = entry_fee + exit_fee
                         
                         # We already deducted entry_fee from summary at entry time.
@@ -469,7 +511,7 @@ class DecisionLogger:
 
                     # Calculate entry fee for reporting
                     entry_value = entry_price * pos_size
-                    fee_rate = self.taker_fee_pct / 100.0
+                    fee_rate = self._get_fee_rate("ENTRY")
                     entry_fee = entry_value * fee_rate
                     
                     # Deduct entry fee from summary immediately
@@ -507,11 +549,12 @@ class DecisionLogger:
                             # Calculate and deduct trading fees
                             entry_value = e_price * pos_size
                             exit_value = entry_price * pos_size
-                            # Use taker fee for market orders (conservative estimate)
-                            fee_rate = self.taker_fee_pct / 100.0
                             
-                            entry_fee = entry_value * fee_rate
-                            exit_fee = exit_value * fee_rate
+                            entry_fee_rate = self._get_fee_rate("ENTRY")
+                            exit_fee_rate = self._get_fee_rate("EXIT_NORMAL")
+                            
+                            entry_fee = entry_value * entry_fee_rate
+                            exit_fee = exit_value * exit_fee_rate
                             total_fees = entry_fee + exit_fee
                             
                             realized_pnl = base_pnl - total_fees
@@ -588,10 +631,20 @@ class DecisionLogger:
             # Calculate and deduct trading fees
             entry_value = entry_price * size
             exit_value = exit_price * size
-            fee_rate = self.taker_fee_pct / 100.0
             
-            entry_fee = entry_value * fee_rate
-            exit_fee = exit_value * fee_rate
+            entry_fee_rate = self._get_fee_rate("ENTRY")
+            
+            # Determine exit type based on reason
+            exit_type = "EXIT_NORMAL"
+            if "protective_stop" in reason.lower():
+                 exit_type = "EXIT_STOP"
+            elif "time" in reason.lower():
+                 exit_type = "EXIT_TIME"
+            
+            exit_fee_rate = self._get_fee_rate(exit_type)
+            
+            entry_fee = entry_value * entry_fee_rate
+            exit_fee = exit_value * exit_fee_rate
             total_fees = entry_fee + exit_fee
             
             realized = base_pnl - total_fees

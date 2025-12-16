@@ -72,3 +72,40 @@ drawdown_alert_threshold = 10.0
 save_interval_sec = 300
 enable_detailed_metrics = True
 pnl_snapshot_interval_sec = 60
+
+[simulation]
+# TRADING MODE SELECTION
+# Options:
+# 1. HF_MARKET: High Frequency, Market Orders (Taker Fees) - Aggressive scalping
+# 2. HF_LIMIT:  High Frequency, Limit Orders (Maker Fees) - Scalping with rebates/low fees
+# 3. LF_MARKET: Low Frequency, Market Orders (Taker Fees) - Swing trading
+# 4. LF_LIMIT:  Low Frequency, Limit Orders (Maker Fees) - Swing trading with precision
+mode = HF_MARKET
+
+# Starting simulated account balance
+starting_balance = 200.0
+
+# Position sizing options:
+# Option 1: Fixed capital per trade
+capital_per_trade = 2.0
+
+# Option 2: Fixed position size in units (disabled when capital_per_trade > 0)
+position_size = 0.01
+
+# --- FUTURES TRADING PARAMETERS ---
+futures_mode = true
+leverage = 10.0
+
+# --- TRADING FEES ---
+maker_fee_pct = 0.02
+taker_fee_pct = 0.04
+use_taker_fees = true
+
+# --- RISK MANAGEMENT ---
+max_concurrent_positions = 2
+max_position_pct = 20.0
+cooldown_ms = 120000
+loss_cooldown_ms = 300000
+max_hold_minutes = 10
+stop_loss_pct = 0.5
+take_profit_pct = 1.0

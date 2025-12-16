@@ -50,6 +50,24 @@ When trading is disabled (public / synthetic), signals are still produced and pe
 ### Configuration Additions
 Add a [simulation] section to config/config.ini to control position sizing for simulated PnL (see Configuration section below).
 
+### Simulation Modes
+Helios supports 4 distinct simulation modes to test different strategies and fee structures:
+
+| Mode | Description | Fees | Cooldowns |
+|------|-------------|------|-----------|
+| **HF_MARKET** | High Frequency, Market Orders | Taker (0.04%) | Standard (2m) |
+| **HF_LIMIT** | High Frequency, Limit Orders | Maker (0.02%)* | Standard (2m) |
+| **LF_MARKET** | Low Frequency, Market Orders | Taker (0.04%) | Extended (15m) |
+| **LF_LIMIT** | Low Frequency, Limit Orders | Maker (0.02%)* | Extended (15m) |
+
+*\*Note: Limit modes use Maker fees for Entry/Exit, but Taker fees for Stop Loss and Time Exits.*
+
+Configure this in `config.ini`:
+```ini
+[simulation]
+mode = HF_MARKET  # or HF_LIMIT, LF_MARKET, LF_LIMIT
+```
+
 ### Safety Principles
 - No implicit "demo" fallback: system aborts if neither credentials nor an allowed read-only/synthetic mode are configured.
 - Mode badge (LIVE / PUBLIC / SYNTHETIC) shown on dashboard and included in /api/prices response.

@@ -434,6 +434,13 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
+            # Add Trading Mode
+            try:
+                cfg = get_config()
+                performance['trading_mode'] = cfg.get('simulation', 'mode', fallback='HF_MARKET')
+            except Exception:
+                performance['trading_mode'] = 'HF_MARKET'
+
             return {
                 'timestamp': get_timestamp(),
                 'performance': performance,
@@ -1246,6 +1253,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             const leverage = perf.leverage || 1.0;
             const dailyPnL = perf.daily_pnl || 0;
             const dailyLimit = perf.daily_loss_limit || 0;
+            const tradingMode = perf.trading_mode || 'HF_MARKET';
 
             let html = '';
             
@@ -1258,6 +1266,14 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     </div>
                 `;
             }
+            
+            // Show Trading Mode
+            html += `
+                <div class="metric-row" style="background:#23863620; padding:6px; border-radius:4px; margin-bottom:8px;">
+                    <span class="metric-label" style="color:#3fb950;">STRATEGY</span>
+                    <span class="metric-value" style="color:#3fb950;">${tradingMode}</span>
+                </div>
+            `;
             
             html += `
                 <div class="metric-row">
