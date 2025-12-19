@@ -65,6 +65,7 @@ class HeliosSystem:
         
         # System state
         self.shutdown_event = threading.Event()
+        self.is_trading_active = False
         
     def initialize(self) -> bool:
         """
@@ -400,24 +401,12 @@ class HeliosSystem:
             
             self.logger.info("Starting Helios Trading System components...")
             
-            # Start components in order
-            self.risk_manager.start()
-            if self.data_ingestor:
-                self.data_ingestor.start()
-            elif self.public_price_ingestor:
-                self.public_price_ingestor.start()
-            self.reddit_ingestor.start()
-            self.performance_tracker.start()
-            self.signal_engine.start()
-            if self.decision_logger:
-                self.decision_logger.start()
-            if self.execution_manager:
-                self.execution_manager.start()
-            self.monitoring_agent.start()
-            self.health_dashboard.start()
-            
-            # Start dynamic watchlist management
-            self._start_watchlist_management()
+            # Start Health Dashboard first
+            if self.health_dashboard:
+                self.health_dashboard.start()
+
+            # Start trading components
+            self.start_trading()
             
             # Set up signal handlers for graceful shutdown
             signal.signal(signal.SIGINT, self._signal_handler)
@@ -433,19 +422,45 @@ class HeliosSystem:
             self.logger.error(f"Failed to start system: {e}")
             self.stop()
             raise
-    
-    def stop(self) -> None:
-        """Stop the trading system gracefully."""
-        if not self.is_running:
+
+    def start_trading(self) -> None:
+        """Start trading components."""
+        if self.is_trading_active:
+            self.logger.warning("Trading is already active")
             return
+
+        self.logger.info("Starting trading components...")
+        self.is_trading_active = True
+
+        # Start components in order
+        if self.risk_manager: self.risk_manager.start()
+        if self.data_ingestor:
+            self.data_ingestor.start()
+        elif self.public_price_ingestor:
+            self.public_price_ingestor.start()
+        if self.reddit_ingestor: self.reddit_ingestor.start()
+        if self.performance_tracker: self.performance_tracker.start()
+        if self.signal_engine: self.signal_engine.start()
+        if self.decision_logger:
+            self.decision_logger.start()
+        if self.execution_manager:
+            self.execution_manager.start()
+        if self.monitoring_agent: self.monitoring_agent.start()
         
-        self.logger.info("Stopping Helios Trading System...")
-        self.is_running = False
-        self.shutdown_event.set()
-        
+        # Start dynamic watchlist management
+        self._start_watchlist_management()
+        self.logger.info("Trading components started")
+
+    def stop_trading(self) -> None:
+        """Stop trading components."""
+        if not self.is_trading_active:
+            return
+
+        self.logger.info("Stopping trading components...")
+        self.is_trading_active = False
+
         # Stop components in reverse order
         components = [
-            ("Health Dashboard", self.health_dashboard),
             ("Monitoring Agent", self.monitoring_agent),
             ("Execution Manager", self.execution_manager),
             ("Signal Engine", self.signal_engine),
@@ -453,6 +468,7 @@ class HeliosSystem:
             ("Performance Tracker", self.performance_tracker),
             ("Reddit Ingestor", self.reddit_ingestor),
             ("Data Ingestor", self.data_ingestor),
+            ("Public Price Ingestor", self.public_price_ingestor),
             ("Risk Manager", self.risk_manager)
         ]
         
@@ -467,7 +483,31 @@ class HeliosSystem:
         
         # Stop watchlist management
         if self.watchlist_thread and self.watchlist_thread.is_alive():
-            self.watchlist_thread.join(timeout=5)
+            # We can't easily join the thread if it's waiting on shutdown_event which is for the whole system
+            # But we can check is_trading_active in the loop
+            pass
+        
+        self.logger.info("Trading components stopped")
+    
+    def stop(self) -> None:
+        """Stop the trading system gracefully."""
+        if not self.is_running:
+            return
+        
+        self.logger.info("Stopping Helios Trading System...")
+        self.is_running = False
+        self.shutdown_event.set()
+        
+        self.stop_trading()
+
+        # Stop Health Dashboard
+        if self.health_dashboard:
+            try:
+                self.logger.info("Stopping Health Dashboard...")
+                self.health_dashboard.stop()
+                self.logger.info("Health Dashboard stopped")
+            except Exception as e:
+                self.logger.error(f"Error stopping Health Dashboard: {e}")
         
         self.logger.info("Helios Trading System stopped")
     
@@ -499,7 +539,8 @@ class HeliosSystem:
         def watchlist_manager():
             while self.is_running and not self.shutdown_event.is_set():
                 try:
-                    self._update_dynamic_watchlist()
+                    if self.is_trading_active:
+                        self._update_dynamic_watchlist()
                     # Update every 5 minutes
                     self.shutdown_event.wait(300)
                 except Exception as e:
@@ -652,6 +693,7 @@ class HeliosSystem:
         try:
             status = {
                 'is_running': self.is_running,
+                'is_trading_active': self.is_trading_active,
                 'start_time': self.start_time,
                 'uptime_seconds': (time.time() * 1000 - self.start_time) / 1000 if self.start_time else 0,
                 'watchlist': self.watchlist,

@@ -86,6 +86,66 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logging.error(f"Error handling request: {e}")
             self._serve_500()
+
+    def do_POST(self):
+        """Handle POST requests."""
+        if not self._check_auth():
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="Helios Dashboard"')
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'Authentication required')
+            return
+
+        try:
+            parsed_path = urlparse(self.path)
+
+            if parsed_path.path == '/api/control':
+                self._handle_control_api()
+            else:
+                self._serve_404()
+
+        except Exception as e:
+            logging.error(f"Error handling POST request: {e}")
+            self._serve_500()
+
+    def _handle_control_api(self):
+        """Handle system control API (start/stop trading)."""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            action = data.get('action')
+            
+            if not self.system_reference:
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'System reference not available'}).encode())
+                return
+
+            if action == 'start':
+                self.system_reference.start_trading()
+                message = 'Trading started'
+            elif action == 'stop':
+                self.system_reference.stop_trading()
+                message = 'Trading stopped'
+            else:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'Invalid action'}).encode())
+                return
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'success', 'message': message}).encode())
+            
+        except Exception as e:
+            logging.error(f"Error in control API: {e}")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
     
     def _serve_dashboard(self):
         """Serve the main dashboard HTML."""
@@ -993,6 +1053,31 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             color: #f0f6fc;
             font-family: monospace;
         }
+        .control-btn {
+            background: #0366d6;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            margin-left: 10px;
+            transition: background-color 0.2s;
+        }
+        .control-btn:hover {
+            background: #0256b4;
+        }
+        .control-btn.stop {
+            background: #d73a49;
+        }
+        .control-btn.stop:hover {
+            background: #b31d28;
+        }
+        .control-btn:disabled {
+            background: #6e7681;
+            cursor: not-allowed;
+        }
         .refresh-btn {
             background: #238636;
             color: white;
@@ -1119,6 +1204,7 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 <button class="refresh-btn" onclick="refreshAll()">🔄 Refresh All</button>
                 <button class="refresh-btn" onclick="toggleAutoRefresh()" id="autoRefreshBtn">▶️ Auto Refresh</button>
                 <button class="refresh-btn" onclick="resetTrends()">♻️ Reset Trends</button>
+                <button id="controlBtn" class="control-btn" onclick="toggleTrading()">Loading...</button>
                 <span id="lastUpdate"></span>
             </div>
         </div>
@@ -1192,6 +1278,21 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 '<span class="status-indicator status-stopped"></span>';
             
             const uptime = data.uptime_seconds ? (data.uptime_seconds / 60).toFixed(1) : 0;
+
+            // Update control button
+            const btn = document.getElementById('controlBtn');
+            if (btn) {
+                if (data.is_trading_active) {
+                    btn.textContent = 'Stop Trading';
+                    btn.className = 'control-btn stop';
+                    btn.onclick = () => controlSystem('stop');
+                } else {
+                    btn.textContent = 'Start Trading';
+                    btn.className = 'control-btn';
+                    btn.onclick = () => controlSystem('start');
+                }
+                btn.disabled = false;
+            }
 
             // Update the global mode badge (shows LIVE/TESTNET/PUBLIC/SYNTHETIC)
             const badge = document.getElementById('modeBadge');
@@ -1652,6 +1753,48 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 html += '</tbody></table>';
                 element.innerHTML = html;
             }
+
+        function toggleTrading() {
+            // This function is just a placeholder, the actual action is set by updateSystemStatus
+            // But initially it might be called before status update
+            const btn = document.getElementById('controlBtn');
+            if (btn.textContent.includes('Start')) {
+                controlSystem('start');
+            } else {
+                controlSystem('stop');
+            }
+        }
+
+        async function controlSystem(action) {
+            const btn = document.getElementById('controlBtn');
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = action === 'start' ? 'Starting...' : 'Stopping...';
+            
+            try {
+                const response = await fetch('/api/control', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ action: action })
+                });
+                
+                const result = await response.json();
+                if (result.status === 'success') {
+                    // Wait a bit for system to update
+                    setTimeout(refreshAll, 1000);
+                } else {
+                    alert('Error: ' + result.error);
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        }
 
         async function refreshAll() {
             // Optional first-load trend reset (keeps initial historical sequence clean)
