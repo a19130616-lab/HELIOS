@@ -64,7 +64,7 @@ python -c "from app.utils import calculate_nobi; print('✅ Helios is ready!')"
 
 - Check the full `README.md` for detailed documentation
 - Review configuration options in `config/config.ini`
-- Monitor system logs in `logs/helios.log`
+- Monitor system logs in `logs/helios_*.log`
 - Ensure Redis is running: `redis-cli ping` should return "PONG"
 
 ---

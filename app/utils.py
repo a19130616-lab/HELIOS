@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional
 import redis
 import numpy as np
 from datetime import datetime
+import pytz
 
 class NumpyEncoder(json.JSONEncoder):
     """Custom JSON encoder that handles numpy data types."""
@@ -30,11 +31,16 @@ def setup_logging(log_level: str = "INFO") -> None:
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
     """
+    # Generate timestamped filename in Beijing time
+    tz = pytz.timezone('Asia/Shanghai')
+    timestamp = datetime.now(tz).strftime('%Y-%m-%d_%H-%M-%S')
+    log_filename = f'logs/helios_{timestamp}.log'
+
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('logs/helios.log'),
+            logging.FileHandler(log_filename),
             logging.StreamHandler()
         ],
         force=True
