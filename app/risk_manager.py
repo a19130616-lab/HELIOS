@@ -544,16 +544,53 @@ class RiskManager:
             # Get positions
             positions = []
             for pos_data in account.get('positions', []):
-                if float(pos_data['positionAmt']) != 0:
+                try:
+                    # Binance futures account payloads vary slightly by endpoint/version.
+                    # Be defensive: missing fields should not break the entire account fetch.
+                    position_amt = float(pos_data.get('positionAmt', 0) or 0)
+                    if position_amt == 0:
+                        continue
+
+                    symbol = pos_data.get('symbol')
+                    if not symbol:
+                        continue
+
+                    entry_raw = (
+                        pos_data.get('entryPrice')
+                        or pos_data.get('entry_price')
+                        or pos_data.get('avgPrice')
+                        or 0
+                    )
+                    mark_raw = (
+                        pos_data.get('markPrice')
+                        or pos_data.get('mark_price')
+                        or pos_data.get('lastPrice')
+                        or 0
+                    )
+
+                    entry_price = float(entry_raw or 0)
+                    current_price = float(mark_raw or 0)
+
+                    # Fallback for current price if markPrice is unavailable
+                    if current_price <= 0:
+                        try:
+                            ticker = self.api_client.ticker_price(symbol=symbol)
+                            current_price = float(ticker.get('price', 0) or 0)
+                        except Exception:
+                            current_price = 0.0
+
                     position = Position(
-                        symbol=pos_data['symbol'],
-                        side=OrderSide.BUY if float(pos_data['positionAmt']) > 0 else OrderSide.SELL,
-                        size=abs(float(pos_data['positionAmt'])),
-                        entry_price=float(pos_data['entryPrice']),
-                        current_price=float(pos_data['markPrice']),
+                        symbol=str(symbol),
+                        side=OrderSide.BUY if position_amt > 0 else OrderSide.SELL,
+                        size=abs(position_amt),
+                        entry_price=entry_price,
+                        current_price=current_price,
                         timestamp=get_timestamp()
                     )
                     positions.append(position)
+                except Exception as pos_err:
+                    self.logger.warning(f"Skipping position parse due to error: {pos_err}")
+                    continue
             
             return AccountInfo(
                 total_balance=total_balance,

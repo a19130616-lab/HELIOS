@@ -9,6 +9,7 @@ import threading
 import json
 import pickle
 import numpy as np
+import uuid
 from typing import Dict, List, Optional, Any
 from queue import Queue
 import xgboost as xgb
@@ -740,13 +741,18 @@ class SignalEngine:
         Args:
             signal: Trading signal to publish
         """
+        # Correlation id for decision <-> execution status.
+        if not getattr(signal, 'signal_id', None):
+            signal.signal_id = uuid.uuid4().hex
+
         signal_data = {
             'symbol': signal.symbol,
             'direction': signal.direction.value,
             'timestamp': signal.timestamp,
             'confidence': signal.confidence,
             'nobi_value': signal.nobi_value,
-            'entry_price': signal.entry_price
+            'entry_price': signal.entry_price,
+            'signal_id': signal.signal_id,
         }
         
         # Add to local queue

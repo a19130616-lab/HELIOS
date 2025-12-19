@@ -9,6 +9,8 @@ import threading
 import json
 from typing import Dict, List, Optional, Any
 from queue import Queue
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from uuid import uuid4
 from binance.um_futures import UMFutures
 from binance.error import ClientError
 
@@ -69,11 +71,20 @@ class ExecutionManager:
         # Execution state
         self.is_running = False
         self.signal_queue = Queue()
+        self._stop_event = threading.Event()
+        self._pubsub = None
+        self.subscription_thread = None
         
         # Order tracking
         self.active_orders = {}  # order_id -> order_info
         self.pending_signals = {}  # symbol -> signal
         self.last_trade_time = {}  # symbol -> timestamp_ms
+
+        # Exchange metadata cache (precision/minNotional/stepSize)
+        # symbol -> {step_size, min_qty, tick_size, min_notional}
+        self._symbol_meta: Dict[str, Dict[str, float]] = {}
+        # Cache user's position mode (Hedge Mode vs One-way). None = unknown.
+        self._dual_side_position: Optional[bool] = None
         
         # Persisted OCO / stop metadata (in-memory index to the redis record)
         # key: symbol -> metadata { id, stop_order_id, tp_order_id, redis_key }
@@ -90,6 +101,7 @@ class ExecutionManager:
         """Start the execution manager."""
         self.logger.info("Starting Execution Manager...")
         self.is_running = True
+        self._stop_event.clear()
         
         # Start signal processing thread
         self.signal_thread = threading.Thread(target=self._process_signals, daemon=True)
@@ -109,6 +121,17 @@ class ExecutionManager:
         """Stop the execution manager."""
         self.logger.info("Stopping Execution Manager...")
         self.is_running = False
+        self._stop_event.set()
+
+        # Stop signal subscription
+        try:
+            if self._pubsub:
+                try:
+                    self._pubsub.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         # Cancel all active orders
         self._cancel_all_orders()
@@ -118,9 +141,11 @@ class ExecutionManager:
     def _setup_signal_subscription(self) -> None:
         """Set up subscription to trading signals from Redis."""
         def signal_handler():
-            pubsub = self.redis_manager.subscribe(["trading_signals"])
-            for message in pubsub.listen():
-                if not self.is_running:
+            # Subscribe immediately so we don't miss early signals during startup.
+            # We keep the thread alive until stop() is called.
+            self._pubsub = self.redis_manager.subscribe(["trading_signals"])
+            for message in self._pubsub.listen():
+                if self._stop_event.is_set():
                     break
                 
                 if message['type'] == 'message':
@@ -132,15 +157,21 @@ class ExecutionManager:
                             timestamp=signal_data['timestamp'],
                             confidence=signal_data['confidence'],
                             nobi_value=signal_data['nobi_value'],
-                            entry_price=signal_data['entry_price']
+                            entry_price=signal_data['entry_price'],
+                            signal_id=signal_data.get('signal_id')
                         )
                         self.signal_queue.put(signal)
+                        self.logger.info(
+                            f"Received signal: {signal.symbol} {signal.direction.value} "
+                            f"conf={signal.confidence:.3f} entry={signal.entry_price}"
+                        )
                     except Exception as e:
                         self.logger.error(f"Error processing signal: {e}")
         
         # Start signal subscription thread
-        self.subscription_thread = threading.Thread(target=signal_handler, daemon=True)
-        self.subscription_thread.start()
+        if not self.subscription_thread or not self.subscription_thread.is_alive():
+            self.subscription_thread = threading.Thread(target=signal_handler, daemon=True)
+            self.subscription_thread.start()
     
     def _process_signals(self) -> None:
         """Process incoming trading signals."""
@@ -173,11 +204,13 @@ class ExecutionManager:
         # Check if risk manager allows new positions
         if self.risk_manager.emergency_mode:
             self.logger.warning(f"Ignoring signal for {signal.symbol} - emergency mode active")
+            self._record_signal_status(signal, execution_status="SKIPPED", execution_error="emergency_mode_active")
             return False
         
         # Check if we already have a position in this symbol
         if signal.symbol in self.risk_manager.positions:
             self.logger.info(f"Ignoring signal for {signal.symbol} - position already open")
+            self._record_signal_status(signal, execution_status="SKIPPED", execution_error="position_already_open")
             return False
             
         # Check trading cooldown
@@ -185,20 +218,47 @@ class ExecutionManager:
             last_time = self.last_trade_time.get(signal.symbol, 0)
             if get_timestamp() - last_time < self.trading_cooldown_ms:
                 self.logger.debug(f"Ignoring signal for {signal.symbol} - cooldown active")
+                self._record_signal_status(signal, execution_status="SKIPPED", execution_error="cooldown_active")
                 return False
         
         # Check if we have a pending order for this symbol
         if signal.symbol in self.pending_signals:
             self.logger.info(f"Ignoring signal for {signal.symbol} - order already pending")
+            self._record_signal_status(signal, execution_status="SKIPPED", execution_error="order_already_pending")
             return False
         
         # Check signal age (ignore signals older than 30 seconds)
         signal_age = get_timestamp() - signal.timestamp
         if signal_age > 30000:  # 30 seconds
             self.logger.warning(f"Ignoring stale signal for {signal.symbol} - age: {signal_age}ms")
+            self._record_signal_status(signal, execution_status="SKIPPED", execution_error=f"stale_signal age_ms={signal_age}")
             return False
         
         return True
+
+    def _record_signal_status(self, signal: TradingSignal, **status_fields: Any) -> None:
+        """Persist execution status for a signal so the dashboard can show live order outcomes."""
+        try:
+            sid = getattr(signal, 'signal_id', None) or status_fields.get('signal_id')
+            if not sid:
+                # Best-effort fallback to avoid dropping status entirely
+                sid = uuid4().hex
+            key = f"signal_status:{sid}"
+
+            payload = {
+                'signal_id': sid,
+                'symbol': getattr(signal, 'symbol', None),
+                'direction': getattr(getattr(signal, 'direction', None), 'value', None),
+                'signal_ts': getattr(signal, 'timestamp', None),
+                'updated_ts': get_timestamp(),
+            }
+            payload.update(status_fields)
+
+            # Keep statuses long enough for dashboard inspection
+            self.redis_manager.set_data(key, payload, expiry=86400)
+        except Exception:
+            # Never let status publishing break execution
+            pass
     
     def _execute_signal(self, signal: TradingSignal) -> None:
         """
@@ -210,6 +270,8 @@ class ExecutionManager:
         try:
             symbol = signal.symbol
             self.logger.info(f"Executing signal: {symbol} {signal.direction.value} @ {signal.entry_price}")
+
+            self._record_signal_status(signal, execution_status="EXECUTING")
             
             # Set leverage for the symbol
             self._set_leverage(symbol)
@@ -223,6 +285,7 @@ class ExecutionManager:
             
             if position_size <= 0:
                 self.logger.warning(f"Risk manager returned zero position size for {symbol}")
+                self._record_signal_status(signal, execution_status="FAILED", execution_error="position_size_zero")
                 return
             
             # Format position size according to symbol precision
@@ -230,6 +293,7 @@ class ExecutionManager:
             
             if formatted_size <= 0:
                 self.logger.warning(f"Formatted position size is zero for {symbol}")
+                self._record_signal_status(signal, execution_status="FAILED", execution_error="formatted_quantity_zero")
                 return
             
             # Determine order side
@@ -239,9 +303,49 @@ class ExecutionManager:
             # Place limit order with small offset to act as maker
             order_price = self._calculate_order_price(signal)
             formatted_price = self._format_price(symbol, order_price)
+
+            # Publish what we are about to attempt
+            try:
+                notional = float(formatted_size) * float(formatted_price)
+            except Exception:
+                notional = None
+            self._record_signal_status(
+                signal,
+                execution_status="ORDER_SUBMITTING",
+                leverage_used=self.leverage,
+                requested_qty=formatted_size,
+                requested_price=formatted_price,
+                position_value_usd=notional,
+                capital_used_usd=(notional / float(self.leverage or 1)) if notional is not None else None,
+            )
+
+            # Ensure notional meets exchange minimums (Binance can reject with -4164).
+            min_notional = self._get_min_notional(symbol)
+            try:
+                px = float(formatted_price)
+            except Exception:
+                px = float(order_price)
+
+            if min_notional and px > 0:
+                current_notional = float(formatted_size) * px
+                if current_notional + 1e-9 < float(min_notional):
+                    target_qty = float(min_notional) / px
+                    bumped_qty = self._format_quantity(symbol, target_qty, rounding="up")
+                    bumped_notional = bumped_qty * px
+                    if bumped_notional + 1e-9 >= float(min_notional):
+                        self.logger.warning(
+                            f"Bumping {symbol} qty to meet minNotional: {current_notional:.4f} -> {bumped_notional:.4f} (min={min_notional})"
+                        )
+                        formatted_size = bumped_qty
+                    else:
+                        self.logger.warning(
+                            f"Cannot meet minNotional for {symbol} after rounding (min={min_notional}). Skipping order."
+                        )
+                        return
             
             # Place the order
-            order = self._place_limit_order(symbol, side, formatted_size, formatted_price)
+            position_side = self._resolve_position_side(signal)
+            order = self._place_limit_order(symbol, side, formatted_size, formatted_price, position_side=position_side)
             
             if order:
                 # Track the order
@@ -257,9 +361,19 @@ class ExecutionManager:
                 self.orders_executed += 1
                 
                 self.logger.info(f"Placed order: {order['orderId']} for {symbol}")
+
+                self._record_signal_status(
+                    signal,
+                    execution_status="ORDER_PLACED",
+                    exchange_order_id=order.get('orderId'),
+                    exchange_status=order.get('status'),
+                )
+            else:
+                self._record_signal_status(signal, execution_status="FAILED", execution_error="order_submission_failed")
             
         except Exception as e:
             self.logger.error(f"Error executing signal for {signal.symbol}: {e}")
+            self._record_signal_status(signal, execution_status="FAILED", execution_error=str(e))
             self.execution_errors += 1
     
     def _set_leverage(self, symbol: str) -> None:
@@ -316,7 +430,14 @@ class ExecutionManager:
             # Sell slightly above current price
             return signal.entry_price * (1 + offset_pct)
     
-    def _place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Optional[Dict[str, Any]]:
+    def _place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        position_side: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Place a limit order.
         
@@ -330,14 +451,20 @@ class ExecutionManager:
             Order response or None if failed
         """
         try:
-            order = self.api_client.new_order(
-                symbol=symbol,
-                side=side,
-                type="LIMIT",
-                timeInForce="GTC",  # Good Till Cancelled
-                quantity=quantity,
-                price=price
-            )
+            params: Dict[str, Any] = {
+                "symbol": symbol,
+                "side": side,
+                "type": "LIMIT",
+                "timeInForce": "GTC",  # Good Till Cancelled
+                "quantity": quantity,
+                "price": price,
+            }
+
+            # If user account is in Hedge Mode, Binance requires positionSide.
+            if self._is_hedge_mode() and position_side:
+                params["positionSide"] = position_side
+
+            order = self.api_client.new_order(**params)
             
             self.logger.info(f"Placed limit order: {symbol} {side} {quantity} @ {price}")
             return order
@@ -560,12 +687,17 @@ class ExecutionManager:
             quantity = self._format_quantity(symbol, abs(position.size))
             
             # Place market order to close position
-            order = self.api_client.new_order(
-                symbol=symbol,
-                side=side,
-                type="MARKET",
-                quantity=quantity
-            )
+            params: Dict[str, Any] = {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": quantity,
+            }
+            if self._is_hedge_mode():
+                # Close the correct side in Hedge Mode.
+                params["positionSide"] = "LONG" if position.side == OrderSide.BUY else "SHORT"
+
+            order = self.api_client.new_order(**params)
             
             self.logger.warning(f"Stop loss executed for {symbol}: {order}")
 
@@ -589,7 +721,7 @@ class ExecutionManager:
         except Exception as e:
             self.logger.error(f"Error executing stop loss for {symbol}: {e}")
     
-    def _format_quantity(self, symbol: str, quantity: float) -> float:
+    def _format_quantity(self, symbol: str, quantity: float, rounding: str = "down") -> float:
         """
         Format quantity according to symbol precision.
         
@@ -601,28 +733,32 @@ class ExecutionManager:
             Formatted quantity
         """
         try:
-            # Get symbol info
-            exchange_info = self.api_client.exchange_info()
-            
-            for symbol_info in exchange_info['symbols']:
-                if symbol_info['symbol'] == symbol:
-                    for filter_info in symbol_info['filters']:
-                        if filter_info['filterType'] == 'LOT_SIZE':
-                            step_size = float(filter_info['stepSize'])
-                            min_qty = float(filter_info['minQty'])
-                            
-                            # Round to step size
-                            rounded_qty = round(quantity / step_size) * step_size
-                            
-                            # Ensure minimum quantity
-                            return max(rounded_qty, min_qty)
-            
-            # Fallback - round to 6 decimal places
-            return round(quantity, 6)
-            
+            meta = self._get_symbol_meta(symbol)
+            step_size = float(meta.get("step_size") or 0.0)
+            min_qty = float(meta.get("min_qty") or 0.0)
+
+            if step_size <= 0:
+                return round(float(quantity), 6)
+
+            qty_d = Decimal(str(quantity))
+            step_d = Decimal(str(step_size))
+
+            rounding_mode = ROUND_DOWN if str(rounding).lower() != "up" else ROUND_UP
+            steps = (qty_d / step_d).to_integral_value(rounding=rounding_mode)
+            quantized = steps * step_d
+
+            # Enforce minQty (round up to the next step if needed)
+            if min_qty > 0:
+                min_d = Decimal(str(min_qty))
+                if quantized < min_d:
+                    steps = (min_d / step_d).to_integral_value(rounding=ROUND_UP)
+                    quantized = steps * step_d
+
+            # Normalize to avoid float artifacts like 1.23000000004
+            return float(quantized.normalize())
         except Exception as e:
             self.logger.error(f"Error formatting quantity for {symbol}: {e}")
-            return round(quantity, 6)
+            return round(float(quantity), 6)
     
     def _format_price(self, symbol: str, price: float) -> str:
         """
@@ -636,28 +772,96 @@ class ExecutionManager:
             Formatted price string
         """
         try:
-            # Get symbol info
-            exchange_info = self.api_client.exchange_info()
-            
-            for symbol_info in exchange_info['symbols']:
-                if symbol_info['symbol'] == symbol:
-                    for filter_info in symbol_info['filters']:
-                        if filter_info['filterType'] == 'PRICE_FILTER':
-                            tick_size = float(filter_info['tickSize'])
-                            
-                            # Round to tick size
-                            rounded_price = round(price / tick_size) * tick_size
-                            
-                            # Format with appropriate precision
-                            precision = len(str(tick_size).rstrip('0').split('.')[-1])
-                            return f"{rounded_price:.{precision}f}"
-            
-            # Fallback
-            return format_price(price)
-            
+            meta = self._get_symbol_meta(symbol)
+            tick_size = float(meta.get("tick_size") or 0.0)
+            if tick_size <= 0:
+                return format_price(price)
+
+            price_d = Decimal(str(price))
+            tick_d = Decimal(str(tick_size))
+            ticks = (price_d / tick_d).to_integral_value(rounding=ROUND_DOWN)
+            quantized = ticks * tick_d
+
+            precision = max(0, len(str(tick_size).rstrip('0').split('.')[-1]))
+            return f"{float(quantized):.{precision}f}"
         except Exception as e:
             self.logger.error(f"Error formatting price for {symbol}: {e}")
             return format_price(price)
+
+    def _get_symbol_meta(self, symbol: str) -> Dict[str, float]:
+        """Fetch and cache exchange metadata (step/tick/minNotional) for a symbol."""
+        symbol = str(symbol).upper()
+        cached = self._symbol_meta.get(symbol)
+        if cached:
+            return cached
+
+        meta: Dict[str, float] = {
+            "step_size": 0.0,
+            "min_qty": 0.0,
+            "tick_size": 0.0,
+            "min_notional": 0.0,
+        }
+        try:
+            info = self.api_client.exchange_info()
+            for s in info.get("symbols", []):
+                if s.get("symbol") != symbol:
+                    continue
+                for f in s.get("filters", []):
+                    if not isinstance(f, dict):
+                        continue
+                    ft = f.get("filterType")
+                    if ft == "LOT_SIZE":
+                        meta["step_size"] = float(f.get("stepSize", 0) or 0)
+                        meta["min_qty"] = float(f.get("minQty", 0) or 0)
+                    elif ft == "PRICE_FILTER":
+                        meta["tick_size"] = float(f.get("tickSize", 0) or 0)
+                    elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
+                        # Different connector versions expose different keys
+                        meta["min_notional"] = float(
+                            f.get("notional")
+                            or f.get("minNotional")
+                            or f.get("minNotionalValue")
+                            or 0
+                        )
+                break
+        except Exception as e:
+            self.logger.debug(f"Failed to load exchangeInfo for {symbol}: {e}")
+
+        self._symbol_meta[symbol] = meta
+        return meta
+
+    def _get_min_notional(self, symbol: str) -> float:
+        try:
+            return float(self._get_symbol_meta(symbol).get("min_notional") or 0.0)
+        except Exception:
+            return 0.0
+
+    def _is_hedge_mode(self) -> bool:
+        """Return True if user's futures account is in Hedge Mode (dualSidePosition)."""
+        if self._dual_side_position is not None:
+            return bool(self._dual_side_position)
+
+        # Best-effort detection; fall back to one-way if API doesn't support it.
+        try:
+            getter = getattr(self.api_client, "get_position_mode", None)
+            if callable(getter):
+                resp = getter()
+                if isinstance(resp, dict) and "dualSidePosition" in resp:
+                    self._dual_side_position = bool(resp.get("dualSidePosition"))
+                    return bool(self._dual_side_position)
+        except Exception as e:
+            self.logger.debug(f"Could not detect position mode: {e}")
+
+        self._dual_side_position = False
+        return False
+
+    def _resolve_position_side(self, signal: TradingSignal) -> Optional[str]:
+        """Map a TradingSignal direction to Binance futures positionSide for Hedge Mode."""
+        if signal.direction == SignalDirection.LONG:
+            return "LONG"
+        if signal.direction == SignalDirection.SHORT:
+            return "SHORT"
+        return None
     
     def _log_execution(self, symbol: str, side: OrderSide, quantity: float, price: float, type: str, commission: float = 0.0, commission_asset: str = "USDT") -> None:
         """

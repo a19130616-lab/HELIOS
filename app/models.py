@@ -72,6 +72,7 @@ class TradingSignal:
     entry_price: float
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
+    signal_id: Optional[str] = None
     
     def __post_init__(self):
         """Validate signal data after initialization."""

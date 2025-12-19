@@ -347,7 +347,19 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     recent_trades = []
 
             # Augment with open positions (unrealized PnL)
-            open_positions = self.redis_manager.get_data('open_positions') or {}
+            # NOTE: In LIVE mode, DecisionLogger's open_positions are simulated and can be misleading.
+            # Only display them in public/synthetic modes unless explicitly enabled.
+            show_simulated_positions = mode in ('public', 'synthetic')
+            try:
+                cfg = get_config()
+                show_simulated_positions = bool(
+                    show_simulated_positions or
+                    cfg.get('dashboard', 'show_simulated_positions_in_live', bool, fallback=False)
+                )
+            except Exception:
+                pass
+
+            open_positions = (self.redis_manager.get_data('open_positions') or {}) if show_simulated_positions else {}
             unrealized_total = 0.0
             enriched_positions = []
             now = get_timestamp()
@@ -594,6 +606,45 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     obj = json.loads(raw)
                     # Basic validation of expected fields
                     if 'symbol' in obj and 'direction' in obj and 'timestamp' in obj:
+                        # In live mode, enrich with real execution status if available
+                        sid = obj.get('signal_id')
+                        status = None
+                        if sid:
+                            try:
+                                status = self.redis_manager.get_data(f"signal_status:{sid}")
+                            except Exception:
+                                status = None
+
+                        if isinstance(status, dict):
+                            # Merge status fields (execution_status, error, order id, attempted qty/price, etc.)
+                            for k, v in status.items():
+                                if k not in obj or obj.get(k) in (None, '', 0):
+                                    obj[k] = v
+
+                            # Prefer execution-derived notional/capital if present
+                            if status.get('position_value_usd') is not None:
+                                obj['position_value_usd'] = status.get('position_value_usd')
+                            if status.get('capital_used_usd') is not None:
+                                obj['capital_used_usd'] = status.get('capital_used_usd')
+
+                            # Make non-success execution explicit in the existing Reason column
+                            exec_status = str(status.get('execution_status') or '').upper()
+                            exec_err = status.get('execution_error')
+                            if exec_status and exec_status not in ('ORDER_PLACED', 'FILLED'):
+                                prefix = f"[{exec_status}]"
+                                if exec_err:
+                                    prefix = f"{prefix} {exec_err}"
+                                base_reason = obj.get('reason') or ''
+                                obj['reason'] = f"{prefix} {base_reason}".strip()
+                        else:
+                            # If this is a live decision and we have no status yet, show it as pending.
+                            try:
+                                if str(obj.get('mode') or '').lower() == 'live':
+                                    base_reason = obj.get('reason') or ''
+                                    obj['reason'] = f"[PENDING] {base_reason}".strip()
+                            except Exception:
+                                pass
+
                         decisions.append(obj)
                 except Exception:
                     continue

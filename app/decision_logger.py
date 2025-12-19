@@ -494,7 +494,14 @@ class DecisionLogger:
                         try:
                             dec_dict['position_value_usd'] = (dec_dict.get('position_size') or 0) * (dec_dict.get('entry_price') or 0)
                             if self.futures_mode:
-                                dec_dict['capital_used_usd'] = dec_dict['position_value_usd'] / (self.leverage or 1.0)
+                                lev = self.leverage or 1.0
+                                if str(mode).lower() == "live":
+                                    try:
+                                        cfg_live = get_config()
+                                        lev = cfg_live.get("risk", "leverage", float, fallback=lev)
+                                    except Exception:
+                                        pass
+                                dec_dict['capital_used_usd'] = dec_dict['position_value_usd'] / (lev or 1.0)
                         except Exception:
                             pass
                         self._push_decision(dec_dict)
@@ -506,12 +513,30 @@ class DecisionLogger:
                     summary = self.redis_manager.get_data("simulated_pnl_summary") or {}
                     total_pnl = float(summary.get("total_pnl", 0.0))
                     current_equity = self.starting_balance + total_pnl
+
+                    # In LIVE mode, prefer real account equity over simulation starting balance
+                    leverage_for_sizing = self.leverage
+                    if str(mode).lower() == "live":
+                        try:
+                            real_info = self.redis_manager.get_data("real_account_info") or {}
+                            current_equity = float(
+                                real_info.get("available_balance")
+                                or real_info.get("total_balance")
+                                or current_equity
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            cfg_live = get_config()
+                            leverage_for_sizing = cfg_live.get("risk", "leverage", float, fallback=leverage_for_sizing)
+                        except Exception:
+                            pass
                     
                     if self.capital_per_trade > 0:
                         # Fixed capital per trade
                         effective_capital = self.capital_per_trade
                         if self.futures_mode:
-                            effective_capital = self.capital_per_trade * self.leverage
+                            effective_capital = self.capital_per_trade * leverage_for_sizing
                         if entry_price > 0:
                             size = effective_capital / entry_price
                     elif self.capital_per_trade <= 0:
@@ -519,7 +544,7 @@ class DecisionLogger:
                         risk_pct = 0.01
                         effective_capital = current_equity * risk_pct
                         if self.futures_mode:
-                            effective_capital = effective_capital * self.leverage
+                            effective_capital = effective_capital * leverage_for_sizing
                         if entry_price > 0:
                             size = effective_capital / entry_price
                             
@@ -600,11 +625,21 @@ class DecisionLogger:
             )
     
             decision_dict = decision.to_dict()
+
+            # Correlation id to join with live execution status (if any)
+            sid = payload.get('signal_id')
+            if sid:
+                decision_dict['signal_id'] = sid
+
             # Add dollar amount metadata for dashboard: notional / capital used
             try:
-                decision_dict['position_value_usd'] = (decision_dict.get('position_size') or 0) * (decision_dict.get('entry_price') or 0)
-                if self.futures_mode:
-                    decision_dict['capital_used_usd'] = decision_dict['position_value_usd'] / (self.leverage or 1.0)
+                # In live mode, do not guess sizing/notional here; ExecutionManager will publish
+                # real attempted order details (or explicit failure) keyed by signal_id.
+                if str(mode).lower() != 'live':
+                    decision_dict['position_value_usd'] = (decision_dict.get('position_size') or 0) * (decision_dict.get('entry_price') or 0)
+                    if self.futures_mode:
+                        lev = self.leverage or 1.0
+                        decision_dict['capital_used_usd'] = decision_dict['position_value_usd'] / (lev or 1.0)
             except Exception:
                 pass
     
