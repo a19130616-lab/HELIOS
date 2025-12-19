@@ -53,7 +53,8 @@ class SignalEngine:
         # 10-minute strategy / aggregation mode (feature-flagged)
         try:
             # Use config flag to enable 10-minute mode (fallback False)
-            self.use_10m_mode = bool(self.config.get('signals', 'use_10m_mode', fallback=False))
+            # Fix: Pass bool type to get() to ensure "false" string is parsed as False boolean
+            self.use_10m_mode = self.config.get('signals', 'use_10m_mode', bool, fallback=False)
         except Exception:
             self.use_10m_mode = False
         try:

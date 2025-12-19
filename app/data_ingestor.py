@@ -95,6 +95,98 @@ class DataIngestor:
             self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
             self.ws_thread.start()
             self.logger.info(f"Data Ingestor started for symbols: {self.symbols}")
+
+    def _normalize_ws_message(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """Normalize websocket callback payloads across connector versions.
+
+        Different websocket client versions may call callbacks as:
+          - callback(message_dict)
+          - callback(ws, message_dict)
+          - callback(ws, message_json_str)
+        Some may also wrap stream messages as {"stream": "...", "data": {...}}.
+
+        Returns the inner message dict (event payload) or None.
+        """
+        raw: Any = None
+        if args:
+            raw = args[-1]
+        elif kwargs:
+            raw = (
+                kwargs.get("data")
+                or kwargs.get("message")
+                or kwargs.get("msg")
+                or kwargs.get("payload")
+            )
+
+        if raw is None:
+            return None
+
+        # Decode JSON strings
+        if isinstance(raw, (str, bytes)):
+            try:
+                raw = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+                raw = json.loads(raw)
+            except Exception:
+                return None
+
+        if not isinstance(raw, dict):
+            return None
+
+        # Unwrap multiplexed messages
+        if "data" in raw and isinstance(raw.get("data"), dict):
+            return raw["data"]
+
+        return raw
+
+    def _make_ws_callback(self, symbol: str, handler: Callable[[str, Dict[str, Any]], None]) -> Callable[..., None]:
+        """Create a safe websocket callback that tolerates signature differences."""
+        def _cb(*args: Any, **kwargs: Any) -> None:
+            try:
+                payload = self._normalize_ws_message(*args, **kwargs)
+                if not payload:
+                    return
+                handler(symbol, payload)
+            except Exception as e:
+                # Avoid crashing websocket receive thread on malformed payloads
+                self.logger.error(f"WebSocket callback error for {symbol}: {e}")
+        return _cb
+
+    def _on_ws_message(self, ws, message: Any) -> None:
+        """Route all incoming websocket messages to the appropriate per-symbol handler.
+
+        NOTE: binance-futures-connector websocket clients dispatch messages ONLY via the
+        `on_message` callback. The stream subscription helper methods accept **kwargs
+        but do not invoke per-stream callbacks.
+        """
+        payload = self._normalize_ws_message(ws, message)
+        if not payload:
+            return
+
+        # Subscription ACKs look like: {"result": null, "id": ...}
+        if "result" in payload and "id" in payload and payload.get("result") is None:
+            return
+
+        event_type = payload.get("e")
+        # Symbol can be at the root or nested (kline)
+        symbol = payload.get("s") or payload.get("ps")
+        if not symbol and isinstance(payload.get("k"), dict):
+            symbol = payload["k"].get("s")
+
+        if not symbol:
+            return
+
+        # Normalize to the same symbol format used everywhere else
+        symbol = str(symbol).upper()
+
+        try:
+            if event_type == "depthUpdate":
+                self._handle_depth_update(symbol, payload)
+            elif event_type == "aggTrade":
+                self._handle_trade_update(symbol, payload)
+            elif event_type == "kline":
+                self._handle_kline_update(symbol, payload)
+        except Exception as e:
+            self.logger.error(f"WebSocket message routing error for {symbol}: {e}")
     
     def stop(self) -> None:
         """Stop the data ingestion process."""
@@ -123,14 +215,79 @@ class DataIngestor:
         # Use testnet if configured
         testnet = self.config.get('binance', 'testnet', bool)
         
-        self.ws_client = UMFuturesWebsocketClient(
-            stream_url="wss://fstream.binance.com" if not testnet else "wss://stream.binancefuture.com"
-        )
+        # Define callbacks for connection debugging
+        def on_open(ws):
+            self.logger.info("✅ Binance WebSocket connection OPENED")
+            
+        def on_close(ws, *args):
+            # Handle variable arguments for on_close (some versions send code/msg, others don't)
+            try:
+                if len(args) >= 2:
+                    code, msg = args[0], args[1]
+                    self.logger.warning(f"⚠️ Binance WebSocket connection CLOSED: code={code}, msg={msg}")
+                else:
+                    self.logger.warning(f"⚠️ Binance WebSocket connection CLOSED: args={args}")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Binance WebSocket connection CLOSED (error parsing args): {e}")
+            
+        def on_error(ws, error):
+            self.logger.error(f"❌ Binance WebSocket connection ERROR: {error}")
+
+        # IMPORTANT: Do not pass stream_url manually unless you are sure.
+        # The library handles the base URL based on on_message/on_error callbacks usually,
+        # but for UMFuturesWebsocketClient, it defaults to production.
+        # If testnet is True, we must explicitly set the testnet URL.
+        # If testnet is False, we can let it default or set the production URL.
         
-        # Subscribe to streams for each symbol
-        for symbol in self.symbols:
-            self._subscribe_symbol_streams(symbol)
-        
+        try:
+            if testnet:
+                self.ws_client = UMFuturesWebsocketClient(
+                    stream_url="wss://stream.binancefuture.com",
+                    on_message=self._on_ws_message,
+                    on_open=on_open,
+                    on_close=on_close,
+                    on_error=on_error
+                )
+            else:
+                # Production default
+                self.ws_client = UMFuturesWebsocketClient(
+                    on_message=self._on_ws_message,
+                    on_open=on_open,
+                    on_close=on_close,
+                    on_error=on_error
+                )
+            # Some versions of binance-futures-connector expose start(); older
+            # ones spin up immediately when subscriptions are created. Call start
+            # only when available to avoid attribute errors seen in production.
+            if hasattr(self.ws_client, "start"):
+                try:
+                    self.ws_client.start()
+                    self.logger.info("WebSocket client background thread started")
+                except Exception as start_err:
+                    self.logger.warning(f"WebSocket client start() failed, continuing without explicit start: {start_err}")
+            
+            self.logger.info(f"WebSocket client initialized (testnet={testnet}). Subscribing to {len(self.symbols)} symbols...")
+            
+            # Subscribe to streams for each symbol
+            for symbol in self.symbols:
+                # Skip ALPACAUSDT for now as it might be causing issues
+                if symbol == 'ALPACAUSDT':
+                    self.logger.warning(f"Skipping subscription for {symbol} to isolate connection issues")
+                    continue
+                    
+                try:
+                    self._subscribe_symbol_streams(symbol)
+                    # Add delay to avoid hitting WebSocket rate limits (5 messages per second)
+                    time.sleep(0.5)
+                except Exception as e:
+                    self.logger.error(f"Failed to subscribe to {symbol}: {e}")
+            
+            self.logger.info("All subscription requests sent. Entering keep-alive loop.")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize WebSocket client: {e}")
+            raise
+
         # Keep connection alive
         while self.is_running:
             time.sleep(1)
@@ -145,26 +302,29 @@ class DataIngestor:
         symbol_lower = symbol.lower()
         
         # Order book depth stream (20 levels, 100ms updates)
-        depth_stream_id = self.ws_client.depth(
+        # Note: Using partial_book_depth instead of depth for binance-futures-connector compatibility
+        depth_stream_id = self.ws_client.partial_book_depth(
             symbol=symbol_lower,
             level=20,
             speed=100,
-            callback=lambda data: self._handle_depth_update(symbol, data)
+            callback=self._make_ws_callback(symbol, self._handle_depth_update)
         )
         self.stream_ids.append(depth_stream_id)
+        time.sleep(0.2)  # Rate limit protection
         
         # Aggregate trade stream
         trade_stream_id = self.ws_client.agg_trade(
             symbol=symbol_lower,
-            callback=lambda data: self._handle_trade_update(symbol, data)
+            callback=self._make_ws_callback(symbol, self._handle_trade_update)
         )
         self.stream_ids.append(trade_stream_id)
+        time.sleep(0.2)  # Rate limit protection
         
         # 1-minute kline stream
         kline_stream_id = self.ws_client.kline(
             symbol=symbol_lower,
             interval="1m",
-            callback=lambda data: self._handle_kline_update(symbol, data)
+            callback=self._make_ws_callback(symbol, self._handle_kline_update)
         )
         self.stream_ids.append(kline_stream_id)
         
@@ -179,6 +339,11 @@ class DataIngestor:
             data: WebSocket data
         """
         try:
+            # Check for error response in data
+            if (data.get('e') == 'error') or ('code' in data and 'msg' in data) or ('msg' in data and 'e' in data):
+                self.logger.error(f"Binance WebSocket Error for {symbol}: {data.get('msg')}")
+                return
+
             # Parse order book data
             bids = [
                 OrderBookLevel(price=float(bid[0]), quantity=float(bid[1]))
@@ -213,13 +378,18 @@ class DataIngestor:
             data: WebSocket data
         """
         try:
+            if (data.get('e') == 'error') or ('code' in data and 'msg' in data):
+                self.logger.error(f"Binance WebSocket Error for {symbol}: {data.get('msg')}")
+                return
+
             # Parse trade data
             trade = TradeData(
                 symbol=symbol,
                 timestamp=data.get('T', get_timestamp()),
                 price=float(data.get('p', 0)),
                 quantity=float(data.get('q', 0)),
-                side=OrderSide.BUY if data.get('m', False) else OrderSide.SELL,
+                # Binance aggTrade field `m` = isBuyerMaker. If buyer is maker, taker is SELL.
+                side=OrderSide.SELL if data.get('m', False) else OrderSide.BUY,
                 trade_id=str(data.get('a', 0))
             )
             
@@ -239,6 +409,10 @@ class DataIngestor:
             data: WebSocket data
         """
         try:
+            if (data.get('e') == 'error') or ('code' in data and 'msg' in data):
+                self.logger.error(f"Binance WebSocket Error for {symbol}: {data.get('msg')}")
+                return
+
             kline_data = data.get('k', {})
             
             # Only process closed klines

@@ -408,11 +408,22 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             performance['open_positions'] = enriched_positions
             # Derive simulated account value from starting balance (config) + equity PnL
             try:
-                starting_balance = float(get_config().get('simulation', 'starting_balance', fallback='10000'))
+                starting_balance = float(get_config().get('simulation', 'starting_balance', fallback='200'))
             except Exception:
-                starting_balance = 10000.0
+                starting_balance = 200.0
             performance['starting_balance'] = starting_balance
             performance['account_value'] = starting_balance + performance.get('total_equity_pnl', 0.0)
+
+            # Try to get real account info from Redis (published by RiskManager)
+            real_account_info = self.redis_manager.get_data('real_account_info')
+            if real_account_info:
+                performance['account_value'] = float(real_account_info.get('total_balance', performance['account_value']))
+                performance['available_balance'] = float(real_account_info.get('available_balance', 0.0))
+                performance['used_margin'] = float(real_account_info.get('used_margin', 0.0))
+                performance['margin_ratio'] = float(real_account_info.get('margin_ratio', 0.0))
+                performance['is_real_balance'] = True
+            else:
+                performance['is_real_balance'] = False
             
             # Ensure futures parameters are included even if not in sim_summary
             if 'futures_mode' not in performance:

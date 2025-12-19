@@ -59,7 +59,13 @@ class ExecutionManager:
             self.persistent_stop_ttl = int(self.config.get('risk', 'persistent_stop_ttl_seconds', fallback='86400'))
         except Exception:
             self.persistent_stop_ttl = 24 * 3600  # 1 day
-        
+            
+        # Trading cooldown
+        try:
+            self.trading_cooldown_ms = self.config.get('trading', 'trading_cooldown_minutes', int, fallback=0) * 60 * 1000
+        except Exception:
+            self.trading_cooldown_ms = 0
+            
         # Execution state
         self.is_running = False
         self.signal_queue = Queue()
@@ -67,6 +73,7 @@ class ExecutionManager:
         # Order tracking
         self.active_orders = {}  # order_id -> order_info
         self.pending_signals = {}  # symbol -> signal
+        self.last_trade_time = {}  # symbol -> timestamp_ms
         
         # Persisted OCO / stop metadata (in-memory index to the redis record)
         # key: symbol -> metadata { id, stop_order_id, tp_order_id, redis_key }
@@ -172,6 +179,13 @@ class ExecutionManager:
         if signal.symbol in self.risk_manager.positions:
             self.logger.info(f"Ignoring signal for {signal.symbol} - position already open")
             return False
+            
+        # Check trading cooldown
+        if self.trading_cooldown_ms > 0:
+            last_time = self.last_trade_time.get(signal.symbol, 0)
+            if get_timestamp() - last_time < self.trading_cooldown_ms:
+                self.logger.debug(f"Ignoring signal for {signal.symbol} - cooldown active")
+                return False
         
         # Check if we have a pending order for this symbol
         if signal.symbol in self.pending_signals:
@@ -434,6 +448,9 @@ class ExecutionManager:
             
             # Log execution
             self._log_execution(symbol, order_info['order_side'], filled_qty, avg_price, "FILLED", commission, commission_asset)
+            
+            # Update last trade time for cooldown
+            self.last_trade_time[symbol] = get_timestamp()
             
         except Exception as e:
             self.logger.error(f"Error handling order fill {order_id}: {e}")

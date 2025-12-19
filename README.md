@@ -239,6 +239,32 @@ connection_string = your_azure_monitor_connection_string
    python main.py
    ```
 
+## ☁️ Deployment
+
+### Azure VM Deployment Examples
+
+**1. Connect to Azure VM via SSH**
+```bash
+ssh -i keys/HeliosBot_key.pem azureuser@20.39.199.2
+```
+
+**2. Deploy Code via Rsync**
+Syncs local code to the remote server, excluding unnecessary files.
+```bash
+rsync -avz -e "ssh -i /Users/yizhuowang/Documents/dev/keys/HeliosBot_key.pem" \
+--exclude 'helios-env' \
+--exclude '.git' \
+--exclude '__pycache__' \
+--exclude 'logs' \
+/Users/yizhuowang/src/Helios/ azureuser@20.39.199.2:~/Helios/
+```
+
+**3. Restart Application on Server**
+Rebuilds and restarts the Docker containers in detached mode.
+```bash
+docker-compose down && docker-compose up -d --build
+```
+
 ## 📊 System Components
 
 ### Data Ingestor

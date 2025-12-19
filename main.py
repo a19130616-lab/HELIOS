@@ -163,25 +163,6 @@ class HeliosSystem:
             api_secret = self.config.get('binance', 'api_secret', str)
             testnet = self.config.get('binance', 'testnet', bool)
 
-            # Environment overrides (prefer env over config for secrets)
-            env_api_key = os.getenv('BINANCE_API_KEY')
-            env_api_secret = os.getenv('BINANCE_API_SECRET')
-            env_testnet = os.getenv('BINANCE_TESTNET')
-
-            if env_api_key:
-                api_key = env_api_key.strip()
-                self.logger.info("Using BINANCE_API_KEY from environment (config file value overridden)")
-            if env_api_secret:
-                api_secret = env_api_secret.strip()
-                self.logger.info("Using BINANCE_API_SECRET from environment (config file value overridden)")
-            if env_testnet:
-                testnet = str(env_testnet).lower() in ("1", "true", "yes", "on")
-                self.logger.info(f"BINANCE_TESTNET override detected -> testnet={testnet}")
-
-            # DEMO_MODE env is deprecated; ignore but note
-            if os.getenv('DEMO_MODE'):
-                self.logger.warning("DEMO_MODE env variable is deprecated; system uses live/testnet or public/synthetic modes")
-            
             def is_placeholder(value: Optional[str]) -> bool:
                 if not value:
                     return True
@@ -195,6 +176,33 @@ class HeliosSystem:
                     return True
                 return False
 
+            # Environment overrides (prefer env over config for secrets ONLY if valid)
+            env_api_key = os.getenv('BINANCE_API_KEY')
+            env_api_secret = os.getenv('BINANCE_API_SECRET')
+            env_testnet = os.getenv('BINANCE_TESTNET')
+
+            if env_api_key:
+                if not is_placeholder(env_api_key):
+                    api_key = env_api_key.strip()
+                    self.logger.info("Using BINANCE_API_KEY from environment (config file value overridden)")
+                else:
+                    self.logger.warning("BINANCE_API_KEY in environment is a placeholder; ignoring and using config file value")
+
+            if env_api_secret:
+                if not is_placeholder(env_api_secret):
+                    api_secret = env_api_secret.strip()
+                    self.logger.info("Using BINANCE_API_SECRET from environment (config file value overridden)")
+                else:
+                    self.logger.warning("BINANCE_API_SECRET in environment is a placeholder; ignoring and using config file value")
+
+            if env_testnet:
+                testnet = str(env_testnet).lower() in ("1", "true", "yes", "on")
+                self.logger.info(f"BINANCE_TESTNET override detected -> testnet={testnet}")
+
+            # DEMO_MODE env is deprecated; ignore but note
+            if os.getenv('DEMO_MODE'):
+                self.logger.warning("DEMO_MODE env variable is deprecated; system uses live/testnet or public/synthetic modes")
+            
             key_placeholder = is_placeholder(api_key)
             secret_placeholder = is_placeholder(api_secret)
 
@@ -309,7 +317,7 @@ class HeliosSystem:
         try:
             # Risk manager (even in public mode for future evaluation logic, but may be limited)
             self.logger.info("Initializing Risk Manager...")
-            self.risk_manager = RiskManager(self.api_client)
+            self.risk_manager = RiskManager(self.api_client, self.redis_manager)
 
             # Ingestion: choose based on resolved operational mode
             if self.operational_mode == 'live':
@@ -523,6 +531,9 @@ class HeliosSystem:
             
             # Take top symbols
             new_watchlist = [t['symbol'] for t in usdt_pairs[:watchlist_size]]
+            
+            # Filter out known problematic symbols (e.g. ALPACAUSDT)
+            new_watchlist = [s for s in new_watchlist if s != 'ALPACAUSDT']
             
             # Update if changed
             if new_watchlist != self.watchlist:

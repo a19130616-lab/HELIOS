@@ -338,7 +338,8 @@ class PerformanceTracker:
             
             # Estimate portfolio value (this would be replaced with actual account value)
             total_net_pnl = sum(record.net_pnl for record in self.trade_records)
-            estimated_value = 10000 + total_net_pnl  # Assuming $10k starting capital
+            starting_balance = float(self.config.get('simulation', 'starting_balance', fallback='10000'))
+            estimated_value = starting_balance + total_net_pnl
             
             # Update tracking
             self.portfolio_value_history.append((current_time, estimated_value))

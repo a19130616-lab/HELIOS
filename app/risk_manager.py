@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from binance.um_futures import UMFutures
 
 from app.models import Position, AccountInfo, RiskAssessment, RiskLevel, OrderSide, SystemMetrics
-from app.utils import kelly_criterion, calculate_atr, get_timestamp
+from app.utils import kelly_criterion, calculate_atr, get_timestamp, RedisManager
 from app.config_manager import get_config
 
 class RiskManager:
@@ -21,14 +21,16 @@ class RiskManager:
     3. Account-level liquidation avoidance
     """
     
-    def __init__(self, api_client: UMFutures):
+    def __init__(self, api_client: UMFutures, redis_manager: Optional[RedisManager] = None):
         """
         Initialize the Risk Manager.
         
         Args:
             api_client: Binance futures API client
+            redis_manager: Redis manager instance (optional, for publishing account info)
         """
         self.api_client = api_client
+        self.redis_manager = redis_manager
         self.config = get_config()
         self.logger = logging.getLogger(__name__)
         
@@ -347,6 +349,23 @@ class RiskManager:
                 return
             
             self.account_info = account_info
+            
+            # Publish real account info to Redis if available
+            if self.redis_manager:
+                try:
+                    # Convert AccountInfo to dict
+                    info_dict = {
+                        'total_balance': account_info.total_balance,
+                        'available_balance': account_info.available_balance,
+                        'used_margin': account_info.used_margin,
+                        'margin_ratio': account_info.margin_ratio,
+                        'timestamp': account_info.timestamp,
+                        'positions_count': len(account_info.positions)
+                    }
+                    self.redis_manager.set_data('real_account_info', info_dict, expiry=60)
+                except Exception as e:
+                    self.logger.warning(f"Failed to publish real account info: {e}")
+
             margin_ratio = account_info.margin_ratio
             
             # Check warning level

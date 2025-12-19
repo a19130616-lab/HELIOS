@@ -12,10 +12,14 @@ connection_string = YOUR_CONNECTION_STRING
 watchlist = BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,XRPUSDT
 watchlist_size = 5
 rescan_interval_sec = 300
+# Cooldown in minutes between trades for the same symbol (0 to disable)
+trading_cooldown_minutes = 15
 
 [signals]
 nobi_depth = 10
 nobi_trigger_threshold = 0.4
+# Set to true to use 10-minute candle strategy (Low Frequency) instead of tick-based NOBI (High Frequency)
+use_10m_mode = false
 ml_model_path = ./models/xgb_model.json
 ml_confidence_threshold = 0.75
 
@@ -86,8 +90,8 @@ mode = HF_MARKET
 starting_balance = 200.0
 
 # Position sizing options:
-# Option 1: Fixed capital per trade
-capital_per_trade = 2.0
+# Option 1: Fixed capital per trade (Set to 0 for dynamic 1% of equity)
+capital_per_trade = 0.0
 
 # Option 2: Fixed position size in units (disabled when capital_per_trade > 0)
 position_size = 0.01

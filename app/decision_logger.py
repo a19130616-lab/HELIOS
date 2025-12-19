@@ -501,12 +501,28 @@ class DecisionLogger:
 
                     # Determine position size
                     size = self.position_size
-                    if self.capital_per_trade > 0 and entry_price > 0:
-                        # For futures, leverage increases buying power
+                    
+                    # Calculate current equity for dynamic sizing
+                    summary = self.redis_manager.get_data("simulated_pnl_summary") or {}
+                    total_pnl = float(summary.get("total_pnl", 0.0))
+                    current_equity = self.starting_balance + total_pnl
+                    
+                    if self.capital_per_trade > 0:
+                        # Fixed capital per trade
                         effective_capital = self.capital_per_trade
                         if self.futures_mode:
                             effective_capital = self.capital_per_trade * self.leverage
-                        size = effective_capital / entry_price
+                        if entry_price > 0:
+                            size = effective_capital / entry_price
+                    elif self.capital_per_trade <= 0:
+                        # Dynamic sizing: 1% of current equity
+                        risk_pct = 0.01
+                        effective_capital = current_equity * risk_pct
+                        if self.futures_mode:
+                            effective_capital = effective_capital * self.leverage
+                        if entry_price > 0:
+                            size = effective_capital / entry_price
+                            
                     pos_size = size
 
                     # Calculate entry fee for reporting
