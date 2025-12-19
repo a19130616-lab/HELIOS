@@ -411,3 +411,9 @@ For questions, issues, or discussions:
 ---
 
 **Disclaimer**: This software is provided "as is" without any guarantees. Cryptocurrency trading involves substantial risk of loss. The authors are not responsible for any financial losses incurred through the use of this software.
+
+
+TODO: 
+1. Decisions should based on the current opening positions
+2. Add current holding and order opening in dashboard
+3. Add one-click stop and start in dashboard
