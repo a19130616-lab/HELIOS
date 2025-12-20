@@ -8,6 +8,8 @@ import json
 import time
 import threading
 import base64
+import os
+import glob
 from typing import Dict, Any, Optional
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +82,8 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 self._serve_decisions_api(parsed_path)
             elif parsed_path.path == '/api/candles':
                 self._serve_candles_api(parsed_path)
+            elif parsed_path.path == '/api/logs':
+                self._serve_logs_api()
             else:
                 self._serve_404()
 
@@ -265,6 +269,62 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logging.error(f"Error serving candles API: {e}")
             self._serve_500()
+
+    def _serve_logs_api(self):
+        """Serve system logs (errors only)."""
+        try:
+            logs_data = self._get_logs_data()
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(logs_data, indent=2).encode())
+            
+        except Exception as e:
+            logging.error(f"Error serving logs API: {e}")
+            self._serve_500()
+
+    def _get_logs_data(self) -> Dict[str, Any]:
+        """Get recent error logs from the log file."""
+        try:
+            # Find the most recent log file
+            log_files = glob.glob('logs/helios_*.log')
+            if not log_files:
+                # Fallback to standard name if timestamped ones not found
+                if os.path.exists('logs/helios.log'):
+                    log_files = ['logs/helios.log']
+                else:
+                    return {'logs': ['No log files found.']}
+            
+            # Sort by modification time, newest first
+            latest_log = max(log_files, key=os.path.getmtime)
+            
+            error_logs = []
+            try:
+                with open(latest_log, 'r') as f:
+                    # Read last 2000 lines to avoid reading huge files
+                    # This is a simple approach; for very large files, seek to end and read backwards is better
+                    # but for this scale, reading all lines is likely fine or we can use deque
+                    from collections import deque
+                    lines = deque(f, maxlen=2000)
+                    
+                    for line in lines:
+                        if 'ERROR' in line:
+                            error_logs.append(line.strip())
+            except Exception as e:
+                return {'logs': [f"Error reading log file: {str(e)}"]}
+            
+            # Return most recent errors first
+            return {
+                'timestamp': get_timestamp(),
+                'filename': latest_log,
+                'logs': list(reversed(error_logs))
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting logs data: {e}")
+            return {'logs': [f"Internal error: {str(e)}"]}
 
     def _serve_404(self):
         """Serve 404 Not Found."""
@@ -1124,6 +1184,23 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
         }
         .prices-table-wrapper { max-height: 250px; }
         .decisions-table-wrapper { max-height: 250px; }
+        .logs-table-wrapper {
+            max-height: 250px;
+            overflow-y: auto;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 0.85em;
+            color: #f85149;
+        }
+        .log-entry {
+            margin-bottom: 4px;
+            border-bottom: 1px solid #21262d;
+            padding-bottom: 4px;
+            word-break: break-all;
+        }
         .small {
             color: #8b949e;
             font-size: 0.75em;
@@ -1244,6 +1321,11 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 <h3>Decisions</h3>
                 <div id="decisionsLog" class="decisions-table-wrapper">Loading...</div>
             </div>
+
+            <div class="status-card" style="grid-column: span 2;">
+                <h3>System Errors</h3>
+                <div id="systemLogs" class="logs-table-wrapper">Loading...</div>
+            </div>
         </div>
         <h2 style="margin:10px 0 15px 4px; color:#58a6ff; font-size:1.3em;">Price Trends</h2>
         <div id="trendBoxes"></div>
@@ -1262,6 +1344,31 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 console.error('Error fetching data:', error);
                 return { error: error.message };
             }
+        }
+
+        async function updateSystemLogs() {
+            const data = await fetchData('/api/logs');
+            const element = document.getElementById('systemLogs');
+            
+            if (data.error) {
+                element.innerHTML = `<div class="log-entry">Error fetching logs: ${data.error}</div>`;
+                return;
+            }
+            
+            if (!data.logs || data.logs.length === 0) {
+                element.innerHTML = '<div class="log-entry" style="color: #28a745;">No recent errors found.</div>';
+                return;
+            }
+            
+            let html = '';
+            // Limit to 50 most recent errors for display
+            const displayLogs = data.logs.slice(0, 50);
+            
+            for (const log of displayLogs) {
+                html += `<div class="log-entry">${log}</div>`;
+            }
+            
+            element.innerHTML = html;
         }
 
         async function updateSystemStatus() {
@@ -1811,7 +1918,8 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                 updatePerformanceMetrics(),
                 updateRecentTrades(),
                 updatePortfolioAlarms(),
-                updateDecisions()
+                updateDecisions(),
+                updateSystemLogs()
             ]);
             
             document.getElementById('lastUpdate').textContent =

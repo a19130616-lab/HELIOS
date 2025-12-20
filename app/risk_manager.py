@@ -62,6 +62,9 @@ class RiskManager:
         self.logger.info("Starting Risk Manager...")
         self.is_running = True
         
+        # Synchronize positions from exchange on startup
+        self._synchronize_positions()
+        
         # Start liquidation avoidance monitoring
         self.monitor_thread = threading.Thread(target=self._run_liquidation_monitor, daemon=True)
         self.monitor_thread.start()
@@ -72,6 +75,43 @@ class RiskManager:
         
         self.logger.info("Risk Manager started")
     
+    def _synchronize_positions(self) -> None:
+        """
+        Synchronize internal position tracking with actual exchange positions.
+        This ensures we account for pre-existing holdings on startup.
+        """
+        try:
+            self.logger.info("Synchronizing positions from exchange...")
+            
+            # Get fresh account info which includes positions
+            account_info = self._get_account_info()
+            
+            if not account_info:
+                self.logger.warning("Could not fetch account info for synchronization")
+                return
+                
+            # Update internal tracking
+            synced_count = 0
+            for position in account_info.positions:
+                # Only track non-zero positions
+                if position.size > 0:
+                    # Calculate initial stop loss if not already set (best effort for existing positions)
+                    if position.stop_loss is None:
+                        position.stop_loss = self._calculate_initial_stop_loss(
+                            position.symbol, 
+                            position.entry_price, 
+                            position.side
+                        )
+                    
+                    self.positions[position.symbol] = position
+                    synced_count += 1
+                    self.logger.info(f"Synced position: {position.symbol} {position.side.value} {position.size} @ {position.entry_price}")
+            
+            self.logger.info(f"Position synchronization complete. Tracked positions: {synced_count}")
+            
+        except Exception as e:
+            self.logger.error(f"Error synchronizing positions: {e}")
+
     def stop(self) -> None:
         """Stop the risk management system."""
         self.logger.info("Stopping Risk Manager...")
@@ -91,6 +131,11 @@ class RiskManager:
             Position size in base currency units
         """
         try:
+            # Check if we already have a position for this symbol
+            if symbol in self.positions:
+                self.logger.info(f"Position already exists for {symbol}, skipping new position sizing.")
+                return 0.0
+
             # Get account balance
             account_info = self._get_account_info()
             if not account_info:
@@ -274,6 +319,58 @@ class RiskManager:
             self.logger.error(f"Error calculating stop loss for {symbol}: {e}")
             # Fallback stop loss
             return entry_price * (0.99 if side == OrderSide.BUY else 1.01)
+
+    def calculate_take_profit(self, symbol: str, entry_price: float, side: OrderSide) -> float:
+        """
+        Calculate take profit price based on ATR or fixed percentage.
+        Targeting 1:2 Risk:Reward ratio.
+        
+        Args:
+            symbol: Trading symbol
+            entry_price: Entry price
+            side: Order side
+            
+        Returns:
+            Take profit price
+        """
+        try:
+            # Handle no API client (public or synthetic mode)
+            if self.api_client is None:
+                multiplier = 0.02 # 2% default target
+            else:
+                # Get recent kline data for ATR calculation
+                klines = self.api_client.klines(symbol=symbol, interval="1m", limit=20)
+                
+                if len(klines) < 14:
+                    multiplier = 0.02
+                else:
+                    # Calculate ATR
+                    highs = [float(kline[2]) for kline in klines]
+                    lows = [float(kline[3]) for kline in klines]
+                    closes = [float(kline[4]) for kline in klines]
+                    
+                    atr = calculate_atr(highs, lows, closes)
+                    
+                    # Calculate multiplier based on ATR/Price ratio
+                    # Target 4 ATR for TP (assuming SL is around 2 ATR)
+                    atr_pct = atr / entry_price
+                    multiplier = atr_pct * 4.0
+            
+            # Calculate TP price
+            if side == OrderSide.BUY:
+                tp_price = entry_price * (1 + multiplier)
+            else:
+                tp_price = entry_price * (1 - multiplier)
+                
+            return tp_price
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating take profit for {symbol}: {e}")
+            # Fallback to 2%
+            if side == OrderSide.BUY:
+                return entry_price * 1.02
+            else:
+                return entry_price * 0.98
     
     def _update_trailing_stop(self, position: Position) -> None:
         """
@@ -422,7 +519,7 @@ class RiskManager:
     def _reduce_leverage(self) -> None:
         """Reduce leverage on all positions."""
         try:
-            for symbol in self.positions.keys():
+            for symbol in list(self.positions.keys()):
                 self.api_client.change_leverage(symbol=symbol, leverage=1)
                 self.logger.info(f"Reduced leverage to 1x for {symbol}")
                 time.sleep(0.1)  # Rate limiting
@@ -433,7 +530,7 @@ class RiskManager:
         """Close positions with unrealized losses."""
         try:
             losing_positions = [
-                (symbol, pos) for symbol, pos in self.positions.items()
+                (symbol, pos) for symbol, pos in list(self.positions.items())
                 if pos.unrealized_pnl < 0
             ]
             
@@ -450,7 +547,7 @@ class RiskManager:
         """Close profitable positions to free up margin."""
         try:
             profitable_positions = [
-                (symbol, pos) for symbol, pos in self.positions.items()
+                (symbol, pos) for symbol, pos in list(self.positions.items())
                 if pos.unrealized_pnl > 0
             ]
             
@@ -501,7 +598,8 @@ class RiskManager:
                     time.sleep(5)
                     continue
                     
-                for symbol, position in self.positions.items():
+                # Create a copy of items to avoid "dictionary changed size during iteration"
+                for symbol, position in list(self.positions.items()):
                     # Get current price and update trailing stop
                     ticker = self.api_client.ticker_price(symbol=symbol)
                     current_price = float(ticker['price'])

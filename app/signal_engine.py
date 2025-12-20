@@ -37,8 +37,10 @@ class SignalEngine:
         """
         self.redis_manager = redis_manager
         self.symbols = symbols
-        self.config = get_config()
         self.logger = logging.getLogger(__name__)
+        self.logger.info(f"DEBUG: SignalEngine initialized with symbols: {self.symbols}")
+        
+        self.config = get_config()
         
         # Configuration parameters
         self.nobi_depth = self.config.get('signals', 'nobi_depth', int)
@@ -178,6 +180,10 @@ class SignalEngine:
         Args:
             symbol: Trading symbol
         """
+        if symbol not in self.price_buffers:
+            self.logger.error(f"DEBUG: Symbol {symbol} not in price_buffers! Skipping.")
+            return
+
         # Get latest order book data
         order_book_data = self._get_latest_order_book(symbol)
         if not order_book_data:
@@ -829,6 +835,51 @@ class SignalEngine:
             return self.signal_queue.get_nowait()
         except:
             return None
+
+    def add_symbol(self, symbol: str) -> None:
+        """
+        Dynamically add a symbol to the signal engine.
+        
+        Args:
+            symbol: Trading symbol to add
+        """
+        if symbol in self.symbols:
+            return
+            
+        self.logger.info(f"Adding symbol {symbol} to Signal Engine")
+        self.symbols.append(symbol)
+        
+        # Initialize buffers
+        self.price_buffers[symbol] = CircularBuffer(100)
+        self.nobi_buffers[symbol] = CircularBuffer(50)
+        self.volume_buffers[symbol] = CircularBuffer(100)
+        self.market_regimes[symbol] = MarketRegime.UNKNOWN
+        self.ten_min_history[symbol] = []
+        self.ten_min_metrics[symbol] = {'confirmed_signals': 0, 'last_confirm_ts': 0}
+        self.last_signal_time[symbol] = 0
+        
+    def remove_symbol(self, symbol: str) -> None:
+        """
+        Dynamically remove a symbol from the signal engine.
+        
+        Args:
+            symbol: Trading symbol to remove
+        """
+        if symbol not in self.symbols:
+            return
+            
+        self.logger.info(f"Removing symbol {symbol} from Signal Engine")
+        self.symbols.remove(symbol)
+        
+        # Clean up buffers
+        self.price_buffers.pop(symbol, None)
+        self.nobi_buffers.pop(symbol, None)
+        self.volume_buffers.pop(symbol, None)
+        self.market_regimes.pop(symbol, None)
+        self.ten_min_history.pop(symbol, None)
+        self.ten_min_metrics.pop(symbol, None)
+        self.last_signal_time.pop(symbol, None)
+        self.last_trade_ids.pop(symbol, None)
     
     def get_health_status(self) -> Dict[str, Any]:
         """

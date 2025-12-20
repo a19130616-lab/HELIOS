@@ -567,6 +567,61 @@ class ExecutionManager:
                 size=filled_qty,
                 entry_price=avg_price
             )
+
+            # --- NEW: Place Exchange-Side Stop Loss & Take Profit ---
+            # Get the position object we just created to access calculated SL
+            position = self.risk_manager.positions.get(symbol)
+            if position:
+                # Determine exit side
+                exit_side = "SELL" if order_info['order_side'] == OrderSide.BUY else "BUY"
+                
+                # 1. Place Stop Loss (STOP_MARKET)
+                if position.stop_loss:
+                    try:
+                        sl_params = {
+                            "symbol": symbol,
+                            "side": exit_side,
+                            "type": "STOP_MARKET",
+                            "stopPrice": self._format_price(symbol, position.stop_loss),
+                            "quantity": self._format_quantity(symbol, filled_qty),
+                            # "timeInForce": "GTC"  <-- REMOVED: STOP_MARKET does not support timeInForce
+                        }
+                        
+                        if self._is_hedge_mode():
+                             # In Hedge Mode: To close a LONG, we SELL with positionSide="LONG"
+                             sl_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
+                        else:
+                             # In One-Way Mode: To close, we just SELL (reduceOnly=True)
+                             sl_params["reduceOnly"] = "true"
+
+                        self.logger.info(f"Placing Exchange SL (Stop Market) for {symbol} at {sl_params['stopPrice']}")
+                        self.api_client.new_order(**sl_params)
+                    except Exception as e:
+                        self.logger.error(f"Failed to place exchange-side SL for {symbol}: {e}")
+
+                # 2. Place Take Profit (LIMIT - Maker)
+                try:
+                    tp_price = self.risk_manager.calculate_take_profit(symbol, avg_price, order_info['order_side'])
+                    
+                    if tp_price:
+                        tp_params = {
+                            "symbol": symbol,
+                            "side": exit_side,
+                            "type": "LIMIT",
+                            "price": self._format_price(symbol, tp_price),
+                            "quantity": self._format_quantity(symbol, filled_qty),
+                            "timeInForce": "GTC"
+                        }
+                        if self._is_hedge_mode():
+                            tp_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
+                        else:
+                            tp_params["reduceOnly"] = "true"
+                        
+                        self.logger.info(f"Placing Exchange TP (Maker) for {symbol} at {tp_params['price']}")
+                        self.api_client.new_order(**tp_params)
+                except Exception as e:
+                    self.logger.error(f"Failed to place exchange-side TP for {symbol}: {e}")
+            # -------------------------------------------------------
             
             # Clean up
             del self.active_orders[order_id]
@@ -628,9 +683,26 @@ class ExecutionManager:
             self.logger.warning(f"Error cancelling order {order_id}: {e}")
     
     def _cancel_all_orders(self) -> None:
-        """Cancel all active orders."""
+        """Cancel all active orders tracked by the bot."""
         for order_id in list(self.active_orders.keys()):
             self._cancel_order(order_id)
+
+    def cancel_exchange_orders(self, symbols: List[str]) -> None:
+        """
+        Cancel all open orders on the exchange for the given symbols.
+        Useful for cleanup on startup.
+        
+        Args:
+            symbols: List of symbols to clean up
+        """
+        self.logger.info("Cleaning up open orders on exchange...")
+        for symbol in symbols:
+            try:
+                self.api_client.cancel_open_orders(symbol=symbol)
+                self.logger.info(f"Cancelled all open orders for {symbol}")
+            except Exception as e:
+                # Ignore error if no orders to cancel
+                self.logger.debug(f"Could not cancel orders for {symbol}: {e}")
     
     def _monitor_stop_losses(self) -> None:
         """Monitor stop losses and close positions when triggered."""
@@ -686,20 +758,64 @@ class ExecutionManager:
             # Format quantity
             quantity = self._format_quantity(symbol, abs(position.size))
             
-            # Place market order to close position
+            # --- CHANGED: Use LIMIT order instead of MARKET to save fees (Maker) ---
+            # We want to close immediately but as a Maker if possible.
+            # However, for a Stop Loss, we usually want guaranteed exit (Taker).
+            # But the user specifically asked: "For closing the orders, can you make sure to use limit orders instead as well?"
+            # So we will try to place a Limit order at a price that is likely to fill but might be Maker if we are lucky,
+            # or at least controlled slippage.
+            # Actually, if it's a STOP LOSS trigger from our internal loop, price is already past our stop.
+            # To be a Maker, we'd need to place it *away* from market, which means we don't close immediately.
+            # That contradicts the concept of a Stop Loss.
+            # BUT, if this is a "Take Profit" or "Signal Close", Limit is good.
+            # If this is a "Hard Stop", Market is safer.
+            # Let's compromise: Use Limit order with a price that crosses the spread (Taker) to ensure fill,
+            # OR if the user really wants Maker, we place it at the touch.
+            # Given "Stop Loss", safety > fees. But let's use LIMIT at a marketable price (IOC/GTC) to control slippage?
+            # No, the user said "use limit orders instead".
+            # Let's assume they mean for "normal" closes. For Emergency Stop Loss, Market is still best practice.
+            # However, I will change this to a LIMIT order with a price slightly worse than market to ensure fill (effectively Taker but Limit type).
+            # Wait, if I use LIMIT at current price, it might not fill if price moves away.
+            
+            # Let's stick to MARKET for _execute_stop_loss because it's a safety mechanism.
+            # I will add a comment explaining why.
+            # BUT, I will modify the "Take Profit" logic (which I added in _handle_order_fill) to be Maker.
+            # And if there is a generic "Close Position" method, I should check that.
+            
+            # Re-reading user request: "For closing the orders, can you make sure to use limit orders instead as well?"
+            # This might apply to when the bot decides to close based on signal reversal or TP.
+            # Since this method is specifically `_execute_stop_loss`, I should probably keep it as Market or aggressive Limit.
+            # Let's use an aggressive Limit order (Limit Taker) to satisfy "use limit orders" but keep safety.
+            
+            # Get current price (ticker)
+            ticker = self.api_client.ticker_price(symbol=symbol)
+            current_price = float(ticker['price'])
+            
+            # For SELL (closing Long), we want to sell lower than current to ensure fill.
+            # For BUY (closing Short), we want to buy higher than current.
+            slippage = 0.01 # 1% slippage allowance
+            if side == "SELL":
+                limit_price = current_price * (1 - slippage)
+            else:
+                limit_price = current_price * (1 + slippage)
+                
             params: Dict[str, Any] = {
                 "symbol": symbol,
                 "side": side,
-                "type": "MARKET",
+                "type": "LIMIT",
+                "timeInForce": "GTC", # Or IOC
                 "quantity": quantity,
+                "price": self._format_price(symbol, limit_price)
             }
             if self._is_hedge_mode():
                 # Close the correct side in Hedge Mode.
                 params["positionSide"] = "LONG" if position.side == OrderSide.BUY else "SHORT"
+            else:
+                params["reduceOnly"] = "true"
 
             order = self.api_client.new_order(**params)
             
-            self.logger.warning(f"Stop loss executed for {symbol}: {order}")
+            self.logger.warning(f"Stop loss (Limit) executed for {symbol}: {order}")
 
             # Fetch commission
             commission = 0.0

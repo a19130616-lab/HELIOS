@@ -273,6 +273,7 @@ class HeliosSystem:
             # 1) Check config for explicit watchlist string
             try:
                 configured = self.config.get('trading', 'watchlist', fallback='')
+                self.logger.info(f"DEBUG: Configured watchlist raw string: '{configured}'")
                 if configured:
                     # Parse comma-separated list and normalize
                     parsed = [s.strip().upper() for s in configured.split(',') if s.strip()]
@@ -280,7 +281,12 @@ class HeliosSystem:
                         self.watchlist = parsed
                         self.logger.info(f"Using configured watchlist from config: {self.watchlist}")
                         return
-            except Exception:
+                    else:
+                        self.logger.warning("DEBUG: Configured watchlist parsed to empty list")
+                else:
+                    self.logger.warning("DEBUG: Configured watchlist is empty or None")
+            except Exception as e:
+                self.logger.error(f"DEBUG: Error reading watchlist from config: {e}")
                 # Ignore parsing errors and fall back to automatic behavior
                 pass
     
@@ -536,6 +542,14 @@ class HeliosSystem:
     
     def _start_watchlist_management(self) -> None:
         """Start dynamic watchlist management."""
+        # Check if dynamic updates are allowed
+        # If user provided a specific watchlist in config, we assume they want to stick to it
+        # unless they explicitly enabled dynamic updates (which we don't have a flag for yet, so we assume NO)
+        configured_watchlist = self.config.get('trading', 'watchlist', fallback='')
+        if configured_watchlist:
+            self.logger.info("Custom watchlist configured - disabling dynamic watchlist updates")
+            return
+
         def watchlist_manager():
             while self.is_running and not self.shutdown_event.is_set():
                 try:
@@ -580,6 +594,7 @@ class HeliosSystem:
             if new_watchlist != self.watchlist:
                 old_watchlist = self.watchlist.copy()
                 self.watchlist = new_watchlist
+                self.logger.info(f"Dynamic Watchlist Update: {old_watchlist} -> {new_watchlist}")
                 
                 # Update components
                 if self.data_ingestor:
@@ -587,16 +602,17 @@ class HeliosSystem:
                     for symbol in old_watchlist:
                         if symbol not in new_watchlist:
                             self.data_ingestor.remove_symbol(symbol)
+                            if self.signal_engine:
+                                self.signal_engine.remove_symbol(symbol)
                     
                     # Add new symbols
                     for symbol in new_watchlist:
                         if symbol not in old_watchlist:
                             self.data_ingestor.add_symbol(symbol)
-                
-                self.logger.info(f"Updated watchlist: {self.watchlist}")
-                
+                            if self.signal_engine:
+                                self.signal_engine.add_symbol(symbol)
         except Exception as e:
-            self.logger.error(f"Error updating watchlist: {e}")
+            self.logger.error(f"Error updating dynamic watchlist: {e}")
     
     def _check_system_health(self) -> None:
         """Check overall system health."""
