@@ -161,13 +161,15 @@ class DecisionLogger:
         # Trading Mode Logic
         self.trading_mode: str = g("simulation", "mode", str, "HF_MARKET")
         
-        # Apply Mode Overrides
-        if "LF" in self.trading_mode:
-            # Low Frequency Mode - Increase cooldowns significantly
-            # 15 minutes entry cooldown, 30 minutes loss cooldown
+        # Previously, LF modes forcibly increased cooldowns to 15/30 minutes.
+        # This is now opt-in so configuration can control the actual trade frequency.
+        enforce_lf_cooldowns: bool = bool(g("simulation", "enforce_lf_cooldowns", bool, False))
+        if enforce_lf_cooldowns and "LF" in self.trading_mode:
             self.cooldown_ms = max(self.cooldown_ms, 900000)
             self.loss_cooldown_ms = max(self.loss_cooldown_ms, 1800000)
-            logging.getLogger(__name__).info(f"Low Frequency Mode ({self.trading_mode}) active: Cooldowns increased to {self.cooldown_ms}ms / {self.loss_cooldown_ms}ms")
+            logging.getLogger(__name__).info(
+                f"Low Frequency Mode ({self.trading_mode}) enforced: Cooldowns set to {self.cooldown_ms}ms / {self.loss_cooldown_ms}ms"
+            )
 
         # Daily loss limit (for small capital protection)
         self.daily_loss_limit_pct: float = g("simulation", "daily_loss_limit_pct", float, 5.0)
@@ -218,8 +220,9 @@ class DecisionLogger:
             return
 
         try:
-            self.logger.info("Starting DecisionLogger (subscribing to 'trading_signals')...")
-            self._pubsub = self.redis_manager.subscribe(["trading_signals"])
+            self.logger.info("Starting DecisionLogger (subscribing to 'trading_signals' and 'trade_executions')...")
+            # Subscribe to both signals (for logging decisions) and executions (for syncing state)
+            self._pubsub = self.redis_manager.subscribe(["trading_signals", "trade_executions"])
             self.is_running = True
             self._stop_event.clear()
             self.thread = threading.Thread(target=self._run, daemon=True)
@@ -265,19 +268,63 @@ class DecisionLogger:
                     break
                 if message.get("type") != "message":
                     continue
+                
+                channel = message.get("channel")
                 raw = message.get("data")
                 if not raw:
                     continue
+                
                 try:
                     payload = json.loads(raw)
                 except Exception as parse_err:
-                    self.logger.error(f"Failed to parse signal payload: {parse_err}")
+                    self.logger.error(f"Failed to parse payload: {parse_err}")
                     continue
 
-                self._handle_signal_payload(payload)
+                if channel == "trading_signals":
+                    self._handle_signal_payload(payload)
+                elif channel == "trade_executions":
+                    self._handle_execution_payload(payload)
+                    
         except Exception as e:
             if self.is_running:
                 self.logger.error(f"DecisionLogger subscriber error: {e}")
+
+    def _handle_execution_payload(self, payload: Dict[str, Any]) -> None:
+        """
+        Handle real trade execution to sync simulated state.
+        If a real trade closes a position, we should clear our simulated position
+        to avoid 'ghost' positions blocking new signals.
+        """
+        try:
+            symbol = payload.get("symbol")
+            exec_type = payload.get("type") # FILLED, STOP_LOSS
+            side = payload.get("side") # BUY, SELL
+            
+            if not symbol or not exec_type or not side:
+                return
+
+            # We only care about closing trades to clear state
+            # If we have an open position in memory
+            with self._lock:
+                if symbol in self._open_positions:
+                    pos = self._open_positions[symbol]
+                    # Check if this execution opposes our position (i.e. is a close)
+                    # pos['direction'] is SignalDirection.LONG or SHORT
+                    # side is "BUY" or "SELL"
+                    
+                    is_long = pos['direction'] == SignalDirection.LONG
+                    is_closing = (is_long and side == "SELL") or (not is_long and side == "BUY")
+                    
+                    if is_closing:
+                        self.logger.info(f"Syncing DecisionLogger: Real execution {exec_type} closed {symbol}. Clearing simulated position.")
+                        del self._open_positions[symbol]
+                        
+                        # Optionally: We could also record the REAL PnL here into the decision log
+                        # but DecisionLogger is primarily for the 'decision' quality.
+                        # The PerformanceTracker handles the real PnL.
+                        
+        except Exception as e:
+            self.logger.error(f"Error handling execution payload in DecisionLogger: {e}")
 
     # ------------------------------------------------------------------------------------
     # Guardrail Supervisor

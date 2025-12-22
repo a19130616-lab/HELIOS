@@ -72,17 +72,19 @@ class RiskManager:
         # Start trailing stop management
         self.trailing_stop_thread = threading.Thread(target=self._manage_trailing_stops, daemon=True)
         self.trailing_stop_thread.start()
+
+        # Start periodic position synchronization
+        self.sync_thread = threading.Thread(target=self._run_periodic_sync, daemon=True)
+        self.sync_thread.start()
         
         self.logger.info("Risk Manager started")
     
     def _synchronize_positions(self) -> None:
         """
         Synchronize internal position tracking with actual exchange positions.
-        This ensures we account for pre-existing holdings on startup.
+        Handles both adding new positions and removing closed ones.
         """
         try:
-            self.logger.info("Synchronizing positions from exchange...")
-            
             # Get fresh account info which includes positions
             account_info = self._get_account_info()
             
@@ -90,27 +92,103 @@ class RiskManager:
                 self.logger.warning("Could not fetch account info for synchronization")
                 return
                 
-            # Update internal tracking
-            synced_count = 0
+            # Track symbols currently active on exchange
+            exchange_symbols = set()
+            
             for position in account_info.positions:
                 # Only track non-zero positions
                 if position.size > 0:
-                    # Calculate initial stop loss if not already set (best effort for existing positions)
-                    if position.stop_loss is None:
-                        position.stop_loss = self._calculate_initial_stop_loss(
-                            position.symbol, 
-                            position.entry_price, 
-                            position.side
-                        )
+                    exchange_symbols.add(position.symbol)
                     
-                    self.positions[position.symbol] = position
-                    synced_count += 1
-                    self.logger.info(f"Synced position: {position.symbol} {position.side.value} {position.size} @ {position.entry_price}")
+                    if position.symbol not in self.positions:
+                        # New position found (startup or manual trade)
+                        # Publish a synthetic execution event so PerformanceTracker can reconstruct
+                        # open positions even if the bot restarted mid-trade.
+                        if self.redis_manager:
+                            try:
+                                self.redis_manager.publish(
+                                    "trade_executions",
+                                    {
+                                        "symbol": position.symbol,
+                                        "side": position.side.value,
+                                        "quantity": float(position.size),
+                                        # Prefer entry_price; fallback to current_price if entry is missing.
+                                        "price": float(position.entry_price or position.current_price or 0.0),
+                                        "type": "SYNC_OPEN",
+                                        "commission": 0.0,
+                                        "commission_asset": "USDT",
+                                        "timestamp": get_timestamp(),
+                                    },
+                                )
+                            except Exception:
+                                pass
+
+                        if position.stop_loss is None:
+                            position.stop_loss = self._calculate_initial_stop_loss(
+                                position.symbol, 
+                                position.entry_price, 
+                                position.side
+                            )
+                        self.positions[position.symbol] = position
+                        self.logger.info(f"Synced NEW position: {position.symbol} {position.side.value} {position.size}")
+                    else:
+                        # Update existing position details (e.g. partial fills, manual adjustments)
+                        # We preserve our local stop_loss unless it's wildly invalid, 
+                        # but we update size and prices.
+                        existing = self.positions[position.symbol]
+                        existing.size = position.size
+                        existing.entry_price = position.entry_price
+                        existing.current_price = position.current_price
+                        # existing.unrealized_pnl = position.unrealized_pnl # If available
             
-            self.logger.info(f"Position synchronization complete. Tracked positions: {synced_count}")
+            # Remove positions that are no longer on exchange (Ghost Positions)
+            for symbol in list(self.positions.keys()):
+                if symbol not in exchange_symbols:
+                    # Position disappeared on exchange (manual close, liquidation, reduce-only TP/SL, etc.)
+                    # Publish a synthetic close event so PerformanceTracker can finalize trade PnL.
+                    try:
+                        closed_pos = self.positions.get(symbol)
+                        if closed_pos and self.redis_manager:
+                            exit_side = OrderSide.SELL if closed_pos.side == OrderSide.BUY else OrderSide.BUY
+                            exit_price = float(getattr(closed_pos, "current_price", 0.0) or 0.0)
+                            if exit_price <= 0 and self.api_client is not None:
+                                try:
+                                    ticker = self.api_client.ticker_price(symbol=symbol)
+                                    exit_price = float(ticker.get("price", 0) or 0.0)
+                                except Exception:
+                                    exit_price = 0.0
+
+                            self.redis_manager.publish(
+                                "trade_executions",
+                                {
+                                    "symbol": symbol,
+                                    "side": exit_side.value,
+                                    "quantity": float(getattr(closed_pos, "size", 0.0) or 0.0),
+                                    "price": float(exit_price),
+                                    "type": "SYNC_CLOSE",
+                                    "commission": 0.0,
+                                    "commission_asset": "USDT",
+                                    "timestamp": get_timestamp(),
+                                },
+                            )
+                    except Exception:
+                        pass
+
+                    self.logger.info(f"Position {symbol} closed on exchange. Removing from memory.")
+                    del self.positions[symbol]
             
         except Exception as e:
             self.logger.error(f"Error synchronizing positions: {e}")
+
+    def _run_periodic_sync(self) -> None:
+        """Periodically synchronize positions with exchange."""
+        while self.is_running:
+            try:
+                time.sleep(15)  # Sync every 15 seconds
+                self._synchronize_positions()
+            except Exception as e:
+                self.logger.error(f"Error in periodic sync: {e}")
+                time.sleep(5)
 
     def stop(self) -> None:
         """Stop the risk management system."""
@@ -234,12 +312,15 @@ class RiskManager:
         position = self.positions[symbol]
         
         # Calculate trade outcome
+        # Guard against rare cases where entry_price is unavailable/zero due to API payload quirks.
+        entry_price = float(position.entry_price or 0.0)
+        exit_price_f = float(exit_price or 0.0)
         if position.side == OrderSide.BUY:
-            pnl = (exit_price - position.entry_price) * position.size
-            pnl_pct = (exit_price - position.entry_price) / position.entry_price
+            pnl = (exit_price_f - entry_price) * position.size
+            pnl_pct = ((exit_price_f - entry_price) / entry_price) if entry_price else 0.0
         else:
-            pnl = (position.entry_price - exit_price) * position.size
-            pnl_pct = (position.entry_price - exit_price) / position.entry_price
+            pnl = (entry_price - exit_price_f) * position.size
+            pnl_pct = ((entry_price - exit_price_f) / entry_price) if entry_price else 0.0
         
         # Record trade for performance tracking
         self._record_trade(position, pnl, pnl_pct)
@@ -450,14 +531,33 @@ class RiskManager:
             # Publish real account info to Redis if available
             if self.redis_manager:
                 try:
-                    # Convert AccountInfo to dict
+                    # Convert AccountInfo to dict (include positions so dashboard can be authentic in LIVE mode)
+                    positions_payload = []
+                    try:
+                        for p in account_info.positions or []:
+                            try:
+                                positions_payload.append({
+                                    'symbol': getattr(p, 'symbol', None),
+                                    'side': getattr(getattr(p, 'side', None), 'value', None),
+                                    'size': float(getattr(p, 'size', 0.0) or 0.0),
+                                    'entry_price': float(getattr(p, 'entry_price', 0.0) or 0.0),
+                                    'current_price': float(getattr(p, 'current_price', 0.0) or 0.0),
+                                    'unrealized_pnl': float(getattr(p, 'unrealized_pnl', 0.0) or 0.0),
+                                    'timestamp': int(getattr(p, 'timestamp', 0) or 0),
+                                })
+                            except Exception:
+                                continue
+                    except Exception:
+                        positions_payload = []
+
                     info_dict = {
                         'total_balance': account_info.total_balance,
                         'available_balance': account_info.available_balance,
                         'used_margin': account_info.used_margin,
                         'margin_ratio': account_info.margin_ratio,
                         'timestamp': account_info.timestamp,
-                        'positions_count': len(account_info.positions)
+                        'positions_count': len(account_info.positions),
+                        'positions': positions_payload,
                     }
                     self.redis_manager.set_data('real_account_info', info_dict, expiry=60)
                 except Exception as e:

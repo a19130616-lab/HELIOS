@@ -61,6 +61,36 @@ class ExecutionManager:
             self.persistent_stop_ttl = int(self.config.get('risk', 'persistent_stop_ttl_seconds', fallback='86400'))
         except Exception:
             self.persistent_stop_ttl = 24 * 3600  # 1 day
+
+        # Exchange-side risk orders (optional).
+        # NOTE: Some Binance endpoints reject STOP_MARKET on UMFutures with -4120.
+        # Default: do NOT place exchange-side SL; keep exchange-side TP enabled.
+        try:
+            raw_val = self.config.get('risk', 'place_exchange_sl', fallback='false')
+            self.place_exchange_sl = str(raw_val).lower() in ('1', 'true', 'yes', 'y')
+        except Exception:
+            self.place_exchange_sl = False
+
+        try:
+            raw_val = self.config.get('risk', 'place_exchange_tp', fallback='true')
+            self.place_exchange_tp = str(raw_val).lower() in ('1', 'true', 'yes', 'y')
+        except Exception:
+            self.place_exchange_tp = True
+
+        # Internal stop-loss close order behavior (limit-only, safety-focused)
+        try:
+            self.stop_loss_limit_slippage_pct = float(
+                self.config.get('risk', 'stop_loss_limit_slippage_pct', float, fallback=0.01)
+            )
+        except Exception:
+            self.stop_loss_limit_slippage_pct = 0.01
+
+        try:
+            self.stop_loss_replace_after_sec = int(
+                self.config.get('risk', 'stop_loss_replace_after_sec', int, fallback=8)
+            )
+        except Exception:
+            self.stop_loss_replace_after_sec = 8
             
         # Trading cooldown
         try:
@@ -77,6 +107,7 @@ class ExecutionManager:
         
         # Order tracking
         self.active_orders = {}  # order_id -> order_info
+        self.monitored_exits = {} # order_id -> {symbol, side, type, timestamp}
         self.pending_signals = {}  # symbol -> signal
         self.last_trade_time = {}  # symbol -> timestamp_ms
 
@@ -114,6 +145,10 @@ class ExecutionManager:
         # Start stop loss monitoring thread
         self.stop_loss_thread = threading.Thread(target=self._monitor_stop_losses, daemon=True)
         self.stop_loss_thread.start()
+        
+        # Start exit monitoring thread
+        self.exit_monitor_thread = threading.Thread(target=self._monitor_exits, daemon=True)
+        self.exit_monitor_thread.start()
         
         self.logger.info("Execution Manager started")
     
@@ -575,8 +610,9 @@ class ExecutionManager:
                 # Determine exit side
                 exit_side = "SELL" if order_info['order_side'] == OrderSide.BUY else "BUY"
                 
-                # 1. Place Stop Loss (STOP_MARKET)
-                if position.stop_loss:
+                # 1. Exchange-side Stop Loss (STOP_MARKET) is optional and disabled by default
+                # because some Binance endpoints reject it with -4120.
+                if self.place_exchange_sl and position.stop_loss:
                     try:
                         sl_params = {
                             "symbol": symbol,
@@ -584,43 +620,52 @@ class ExecutionManager:
                             "type": "STOP_MARKET",
                             "stopPrice": self._format_price(symbol, position.stop_loss),
                             "quantity": self._format_quantity(symbol, filled_qty),
-                            # "timeInForce": "GTC"  <-- REMOVED: STOP_MARKET does not support timeInForce
                         }
-                        
-                        if self._is_hedge_mode():
-                             # In Hedge Mode: To close a LONG, we SELL with positionSide="LONG"
-                             sl_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
-                        else:
-                             # In One-Way Mode: To close, we just SELL (reduceOnly=True)
-                             sl_params["reduceOnly"] = "true"
 
-                        self.logger.info(f"Placing Exchange SL (Stop Market) for {symbol} at {sl_params['stopPrice']}")
+                        if self._is_hedge_mode():
+                            sl_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
+                        else:
+                            sl_params["reduceOnly"] = "true"
+
+                        self.logger.info(
+                            f"Placing Exchange SL (Stop Market) for {symbol} at {sl_params['stopPrice']}"
+                        )
                         self.api_client.new_order(**sl_params)
                     except Exception as e:
                         self.logger.error(f"Failed to place exchange-side SL for {symbol}: {e}")
 
                 # 2. Place Take Profit (LIMIT - Maker)
-                try:
-                    tp_price = self.risk_manager.calculate_take_profit(symbol, avg_price, order_info['order_side'])
-                    
-                    if tp_price:
-                        tp_params = {
-                            "symbol": symbol,
-                            "side": exit_side,
-                            "type": "LIMIT",
-                            "price": self._format_price(symbol, tp_price),
-                            "quantity": self._format_quantity(symbol, filled_qty),
-                            "timeInForce": "GTC"
-                        }
-                        if self._is_hedge_mode():
-                            tp_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
-                        else:
-                            tp_params["reduceOnly"] = "true"
-                        
-                        self.logger.info(f"Placing Exchange TP (Maker) for {symbol} at {tp_params['price']}")
-                        self.api_client.new_order(**tp_params)
-                except Exception as e:
-                    self.logger.error(f"Failed to place exchange-side TP for {symbol}: {e}")
+                if self.place_exchange_tp:
+                    try:
+                        tp_price = self.risk_manager.calculate_take_profit(symbol, avg_price, order_info['order_side'])
+
+                        if tp_price:
+                            tp_params = {
+                                "symbol": symbol,
+                                "side": exit_side,
+                                "type": "LIMIT",
+                                "price": self._format_price(symbol, tp_price),
+                                "quantity": self._format_quantity(symbol, filled_qty),
+                                "timeInForce": "GTC",
+                            }
+                            if self._is_hedge_mode():
+                                tp_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
+                            else:
+                                tp_params["reduceOnly"] = "true"
+
+                            self.logger.info(f"Placing Exchange TP (Maker) for {symbol} at {tp_params['price']}")
+                            tp_order = self.api_client.new_order(**tp_params)
+
+                            # Track TP order for execution logging
+                            if tp_order and 'orderId' in tp_order:
+                                self.monitored_exits[tp_order['orderId']] = {
+                                    'symbol': symbol,
+                                    'side': OrderSide(tp_params['side']),
+                                    'type': 'TAKE_PROFIT',
+                                    'timestamp': get_timestamp()
+                                }
+                    except Exception as e:
+                        self.logger.error(f"Failed to place exchange-side TP for {symbol}: {e}")
             # -------------------------------------------------------
             
             # Clean up
@@ -716,6 +761,85 @@ class ExecutionManager:
             except Exception as e:
                 self.logger.error(f"Error monitoring stop losses: {e}")
                 time.sleep(5)
+
+    def _monitor_exits(self) -> None:
+        """Monitor exit orders (TP) and log execution when filled."""
+        while self.is_running:
+            try:
+                # Create copy of keys to avoid modification during iteration
+                order_ids = list(self.monitored_exits.keys())
+                
+                for order_id in order_ids:
+                    self._check_exit_status(order_id)
+                
+                time.sleep(2)  # Check every 2 seconds
+                
+            except Exception as e:
+                self.logger.error(f"Error in exit monitor loop: {e}")
+                time.sleep(5)
+
+    def _check_exit_status(self, order_id: str) -> None:
+        """
+        Check status of an exit order.
+        
+        Args:
+            order_id: Order ID
+        """
+        try:
+            if order_id not in self.monitored_exits:
+                return
+            
+            exit_info = self.monitored_exits[order_id]
+            symbol = exit_info['symbol']
+            
+            # Query order status
+            order = self.api_client.query_order(symbol=symbol, orderId=order_id)
+            status = order['status']
+            
+            if status == 'FILLED':
+                exit_type = exit_info.get('type') or 'FILLED'
+                # Log execution
+                filled_qty = float(order['executedQty'])
+                avg_price = float(order['avgPrice'])
+                
+                # Fetch commission
+                commission = 0.0
+                commission_asset = "USDT"
+                try:
+                    trades = self.api_client.get_account_trades(symbol=symbol, orderId=order_id)
+                    for trade in trades:
+                        commission += float(trade.get('commission', 0.0))
+                        commission_asset = trade.get('commissionAsset', commission_asset)
+                except Exception:
+                    pass
+                
+                self._log_execution(
+                    symbol=symbol,
+                    side=exit_info['side'],
+                    quantity=filled_qty,
+                    price=avg_price,
+                    type=str(exit_type),
+                    commission=commission,
+                    commission_asset=commission_asset
+                )
+                
+                self.logger.info(f"Exit order {order_id} filled for {symbol}")
+                
+                # Remove from monitored exits
+                del self.monitored_exits[order_id]
+                
+                # Update RiskManager
+                self.risk_manager.remove_position(symbol, avg_price, str(exit_type))
+
+            elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                del self.monitored_exits[order_id]
+                
+        except Exception as e:
+            self.logger.error(f"Error checking exit status {order_id}: {e}")
+            # If order not found (e.g. 404), remove it
+            if "Order does not exist" in str(e) or "Order was not found" in str(e):
+                if order_id in self.monitored_exits:
+                    del self.monitored_exits[order_id]
     
     def _check_stop_loss(self, symbol: str) -> None:
         """
@@ -749,15 +873,59 @@ class ExecutionManager:
         try:
             if symbol not in self.risk_manager.positions:
                 return
+
+            # If a stop-loss exit order is already pending for this symbol, don't place duplicates.
+            # If it's been pending too long, cancel and replace (avoids getting stuck on a GTC limit).
+            now_ts = get_timestamp()
+            for existing_order_id, info in list(self.monitored_exits.items()):
+                if info.get('symbol') == symbol and info.get('type') == 'STOP_LOSS':
+                    age_ms = now_ts - int(info.get('timestamp') or now_ts)
+                    if age_ms < int(self.stop_loss_replace_after_sec) * 1000:
+                        return
+                    try:
+                        self.api_client.cancel_order(symbol=symbol, orderId=existing_order_id)
+                    except Exception:
+                        pass
+                    try:
+                        del self.monitored_exits[existing_order_id]
+                    except Exception:
+                        pass
             
             position = self.risk_manager.positions[symbol]
             
             # Determine order side (opposite of position)
             side = "SELL" if position.side == OrderSide.BUY else "BUY"
+
+            # If we have a TP order open on the exchange for this symbol, cancel it before placing SL.
+            # This prevents a later TP fill from causing unexpected behavior once SL closes the position.
+            for tp_order_id, info in list(self.monitored_exits.items()):
+                if info.get('symbol') == symbol and info.get('type') == 'TAKE_PROFIT':
+                    try:
+                        self.api_client.cancel_order(symbol=symbol, orderId=tp_order_id)
+                    except Exception:
+                        pass
+                    try:
+                        del self.monitored_exits[tp_order_id]
+                    except Exception:
+                        pass
             
             # Format quantity
-            quantity = self._format_quantity(symbol, abs(position.size))
+            # IMPORTANT: For Stop Loss (ReduceOnly), we must NOT round up to minQty if it exceeds our actual position.
+            # _format_quantity by default might round up to meet minQty.
+            # Here we explicitly format to step size but ensure we don't exceed position.size.
             
+            # 1. Format to step size (rounding down)
+            quantity = self._format_quantity(symbol, abs(position.size), rounding="down")
+            
+            # 2. Double check we didn't round up (though rounding="down" shouldn't)
+            # and that we don't send 0.
+            if quantity > abs(position.size):
+                quantity = self._format_quantity(symbol, abs(position.size) * 0.999, rounding="down")
+                
+            if quantity <= 0:
+                self.logger.warning(f"Calculated SL quantity for {symbol} is 0. Position size: {position.size}")
+                return
+
             # --- CHANGED: Use LIMIT order instead of MARKET to save fees (Maker) ---
             # We want to close immediately but as a Maker if possible.
             # However, for a Stop Loss, we usually want guaranteed exit (Taker).
@@ -793,7 +961,7 @@ class ExecutionManager:
             
             # For SELL (closing Long), we want to sell lower than current to ensure fill.
             # For BUY (closing Short), we want to buy higher than current.
-            slippage = 0.01 # 1% slippage allowance
+            slippage = float(self.stop_loss_limit_slippage_pct)  # default 1% slippage allowance
             if side == "SELL":
                 limit_price = current_price * (1 - slippage)
             else:
@@ -803,7 +971,8 @@ class ExecutionManager:
                 "symbol": symbol,
                 "side": side,
                 "type": "LIMIT",
-                "timeInForce": "GTC", # Or IOC
+                # IOC prevents stale stop-loss limits from sitting on the book while the position stays open.
+                "timeInForce": "IOC",
                 "quantity": quantity,
                 "price": self._format_price(symbol, limit_price)
             }
@@ -814,25 +983,16 @@ class ExecutionManager:
                 params["reduceOnly"] = "true"
 
             order = self.api_client.new_order(**params)
-            
-            self.logger.warning(f"Stop loss (Limit) executed for {symbol}: {order}")
+            self.logger.warning(f"Stop loss (Limit) submitted for {symbol}: {order}")
 
-            # Fetch commission
-            commission = 0.0
-            commission_asset = "USDT"
-            try:
-                trades = self.api_client.get_account_trades(symbol=symbol, orderId=order['orderId'])
-                for trade in trades:
-                    commission += float(trade.get('commission', 0.0))
-                    commission_asset = trade.get('commissionAsset', commission_asset)
-            except Exception as e:
-                self.logger.error(f"Error fetching commission for SL {symbol}: {e}")
-            
-            # Remove position from risk manager
-            self.risk_manager.remove_position(symbol, position.current_price, "STOP_LOSS")
-            
-            # Log execution
-            self._log_execution(symbol, position.side, quantity, position.current_price, "STOP_LOSS", commission, commission_asset)
+            # Track stop-loss order for fill monitoring and performance logging.
+            if order and 'orderId' in order:
+                self.monitored_exits[order['orderId']] = {
+                    'symbol': symbol,
+                    'side': OrderSide(side),
+                    'type': 'STOP_LOSS',
+                    'timestamp': get_timestamp()
+                }
             
         except Exception as e:
             self.logger.error(f"Error executing stop loss for {symbol}: {e}")
@@ -864,9 +1024,16 @@ class ExecutionManager:
             quantized = steps * step_d
 
             # Enforce minQty (round up to the next step if needed)
+            # NOTE: This logic is dangerous for ReduceOnly orders if the position size is exactly minQty
+            # but slightly less due to float precision.
             if min_qty > 0:
                 min_d = Decimal(str(min_qty))
                 if quantized < min_d:
+                    # Only round up if we are NOT explicitly rounding down (which implies we want to stay under a cap)
+                    # However, the 'rounding' param controls the step rounding, not this minQty check.
+                    # We'll assume if the user asked for 'down', they might be sensitive to caps, 
+                    # but usually minQty is a hard exchange requirement.
+                    # For Stop Loss, we handle this in _execute_stop_loss by checking against position size.
                     steps = (min_d / step_d).to_integral_value(rounding=ROUND_UP)
                     quantized = steps * step_d
 

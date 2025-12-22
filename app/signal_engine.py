@@ -47,6 +47,13 @@ class SignalEngine:
         self.nobi_threshold = self.config.get('signals', 'nobi_trigger_threshold', float)
         self.ml_confidence_threshold = self.config.get('signals', 'ml_confidence_threshold', float)
         self.ml_model_path = self.config.get('signals', 'ml_model_path')
+
+        # Volume-spike filter (whale confirmation)
+        # If <= 1.0, the filter is effectively disabled.
+        try:
+            self.volume_spike_multiplier = float(self.config.get('signals', 'volume_spike_multiplier', float, fallback=1.5))
+        except Exception:
+            self.volume_spike_multiplier = 1.5
         
         # Machine Learning model
         self.ml_model = None
@@ -421,8 +428,9 @@ class SignalEngine:
                 avg_vol = sum(volumes[:-1]) / (len(volumes)-1) if len(volumes) > 1 else current_vol
                 vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
                 
-                # Filter: Require trade size to be at least 1.5x average (Significant interest)
-                if avg_vol > 0 and current_vol < (avg_vol * 1.5):
+                # Filter: Require trade size to be at least N x average (Significant interest)
+                # If multiplier <= 1.0, treat as disabled.
+                if self.volume_spike_multiplier > 1.0 and avg_vol > 0 and current_vol < (avg_vol * self.volume_spike_multiplier):
                     # Log rejection
                     self.decision_logger.log_decision({
                         "timestamp": get_timestamp(),
@@ -453,7 +461,7 @@ class SignalEngine:
                 # Filter: Avoid buying if price is significantly above VWAP (Overextended)
                 # Filter: Avoid selling if price is significantly below VWAP (Oversold)
                 if direction == SignalDirection.LONG and current_price > vwap * 1.005: # 0.5% buffer
-                    self.decision_logger.log_decision({
+                    log_payload = {
                         "timestamp": get_timestamp(),
                         "symbol": symbol,
                         "price": current_price,
@@ -464,10 +472,12 @@ class SignalEngine:
                         "ml_confidence": 0,
                         "decision": "REJECT",
                         "reason": "Price > VWAP (Overextended)"
-                    })
+                    }
+                    self.decision_logger.log_decision(log_payload)
+                    self._log_decision_to_redis(log_payload)
                     return
                 if direction == SignalDirection.SHORT and current_price < vwap * 0.995: # 0.5% buffer
-                    self.decision_logger.log_decision({
+                    log_payload = {
                         "timestamp": get_timestamp(),
                         "symbol": symbol,
                         "price": current_price,
@@ -478,7 +488,9 @@ class SignalEngine:
                         "ml_confidence": 0,
                         "decision": "REJECT",
                         "reason": "Price < VWAP (Oversold)"
-                    })
+                    }
+                    self.decision_logger.log_decision(log_payload)
+                    self._log_decision_to_redis(log_payload)
                     return
             # ------------------------------------------
             
@@ -513,7 +525,7 @@ class SignalEngine:
                 self.logger.info(f"Generated {direction.value} signal for {symbol} - "
                                f"NOBI: {nobi_value:.4f}, Confidence: {confidence:.3f}")
             else:
-                self.decision_logger.log_decision({
+                log_payload = {
                     "timestamp": get_timestamp(),
                     "symbol": symbol,
                     "price": order_book_data.get('mid_price', 0),
@@ -524,7 +536,9 @@ class SignalEngine:
                     "ml_confidence": f"{confidence:.3f}",
                     "decision": "REJECT",
                     "reason": f"Low ML Confidence ({confidence:.3f})"
-                })
+                }
+                self.decision_logger.log_decision(log_payload)
+                self._log_decision_to_redis(log_payload)
                 self.signals_generated += 1
                 
                 self.logger.info(f"Generated {direction.value} signal for {symbol} - "
@@ -533,6 +547,25 @@ class SignalEngine:
         except Exception as e:
             self.logger.error(f"Error handling NOBI trigger for {symbol}: {e}")
     
+    def _log_decision_to_redis(self, decision_data: Dict[str, Any]) -> None:
+        """Log decision to Redis for dashboard visibility."""
+        try:
+            # Ensure timestamp is present
+            if 'timestamp' not in decision_data:
+                decision_data['timestamp'] = get_timestamp()
+            
+            # Ensure direction is present (dashboard requirement)
+            if 'direction' not in decision_data:
+                # Map 'decision' (e.g. REJECT) to 'direction'
+                decision_data['direction'] = decision_data.get('decision', 'UNKNOWN')
+            
+            # Push to Redis list
+            self.redis_manager.redis_client.lpush('decision_logs', json.dumps(decision_data))
+            # Trim list to keep size manageable
+            self.redis_manager.redis_client.ltrim('decision_logs', 0, 499)
+        except Exception as e:
+            self.logger.error(f"Error logging decision to Redis: {e}")
+
     def _is_too_soon_for_signal(self, symbol: str, min_interval_ms: int = 30000) -> bool:
         """
         Check if it's too soon to generate another signal for this symbol.

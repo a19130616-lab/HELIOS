@@ -450,6 +450,9 @@ class HeliosSystem:
         if self.decision_logger:
             self.decision_logger.start()
         if self.execution_manager:
+            # Clean up any orphan orders from previous sessions
+            if self.watchlist:
+                self.execution_manager.cancel_exchange_orders(self.watchlist)
             self.execution_manager.start()
         if self.monitoring_agent: self.monitoring_agent.start()
         

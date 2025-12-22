@@ -86,14 +86,20 @@ class PerformanceTracker:
         self.portfolio_value_history = []  # (timestamp, value)
         self.peak_portfolio_value = 0.0
         self.start_time = get_timestamp()
-        
-        # Subscribe to trade executions
-        self._setup_trade_subscription()
+        self.open_positions = {} # symbol -> position_data
+
+        # NOTE: Trade execution subscription must be started after `start()` sets
+        # `is_running=True`. Otherwise the subscription thread can exit immediately
+        # and never process executions.
+        self.subscription_thread = None
     
     def start(self) -> None:
         """Start the performance tracker (fresh session metrics only)."""
         self.logger.info("Starting Performance Tracker...")
         self.is_running = True
+
+        # Subscribe to trade executions (must happen after is_running=True)
+        self._setup_trade_subscription()
 
         # IMPORTANT: Explicitly reset all in‑memory state so a hot-restart (without full process exit)
         # does NOT retain prior run's trade history / portfolio stats.
@@ -166,6 +172,10 @@ class PerformanceTracker:
     
     def _setup_trade_subscription(self) -> None:
         """Set up subscription to trade executions."""
+        # Idempotent: avoid starting multiple subscriber threads on repeated start() calls.
+        if self.subscription_thread is not None and self.subscription_thread.is_alive():
+            return
+
         def trade_handler():
             pubsub = self.redis_manager.subscribe(["trade_executions"])
             for message in pubsub.listen():
@@ -191,120 +201,135 @@ class PerformanceTracker:
             trade_data: Trade execution data
         """
         try:
-            if trade_data['type'] in ['FILLED', 'STOP_LOSS']:
-                # For closing trades, calculate performance
-                if trade_data['type'] == 'STOP_LOSS':
-                    self._record_trade_close(trade_data)
+            # Only process events that represent an execution affecting position state.
+            # SYNC_* are emitted by RiskManager when it discovers positions opened/closed
+            # on the exchange outside this process (restart/manual close/liquidation/etc.).
+            if trade_data['type'] not in ['FILLED', 'TAKE_PROFIT', 'STOP_LOSS', 'SYNC_OPEN', 'SYNC_CLOSE']:
+                return
+
+            symbol = trade_data['symbol']
+            side = trade_data['side']
+            quantity = float(trade_data['quantity'])
+            price = float(trade_data['price'])
+            timestamp = trade_data['timestamp']
+            commission = float(trade_data.get('commission', 0.0))
+
+            # Check if we have an open position for this symbol
+            if symbol in self.open_positions:
+                position = self.open_positions[symbol]
                 
-                # Update portfolio value tracking
-                self._update_portfolio_tracking(trade_data)
+                # Check if this trade is in the same direction (Adding to position)
+                if position['side'] == side:
+                    # Update average entry price
+                    total_cost = (position['price'] * position['quantity']) + (price * quantity)
+                    total_quantity = position['quantity'] + quantity
+                    position['price'] = total_cost / total_quantity
+                    position['quantity'] = total_quantity
+                    self.logger.info(f"Updated position for {symbol}: Increased size to {total_quantity}")
+                
+                # Trade is in opposite direction (Closing/Reducing position)
+                else:
+                    # Calculate PnL on the portion being closed
+                    close_quantity = min(quantity, position['quantity'])
+                    
+                    if position['side'] == 'BUY': # Long position, Selling to close
+                        pnl = (price - position['price']) * close_quantity
+                        pnl_pct = (price - position['price']) / position['price']
+                    else: # Short position, Buying to close
+                        pnl = (position['price'] - price) * close_quantity
+                        pnl_pct = (position['price'] - price) / position['price']
+                    
+                    # Record the trade
+                    self._record_completed_trade(
+                        symbol=symbol,
+                        side=position['side'], # Record the side of the position being closed
+                        entry_price=position['price'],
+                        exit_price=price,
+                        quantity=close_quantity,
+                        entry_time=position['timestamp'],
+                        exit_time=timestamp,
+                        pnl=pnl,
+                        pnl_pct=pnl_pct,
+                        exit_reason=trade_data['type'],
+                        commission=commission
+                    )
+                    
+                    # Update remaining position
+                    remaining_quantity = position['quantity'] - close_quantity
+                    if remaining_quantity > 0.00000001: # Float tolerance
+                        position['quantity'] = remaining_quantity
+                        self.logger.info(f"Updated position for {symbol}: Reduced size to {remaining_quantity}")
+                    else:
+                        del self.open_positions[symbol]
+                        self.logger.info(f"Closed position for {symbol}")
+            
+            else:
+                # No open position, this is a new entry
+                self.open_positions[symbol] = {
+                    'symbol': symbol,
+                    'side': side,
+                    'price': price,
+                    'quantity': quantity,
+                    'timestamp': timestamp
+                }
+                self.logger.info(f"Opened new position tracking for {symbol} {side} @ {price}")
+
+            # Update portfolio value tracking
+            self._update_portfolio_tracking(trade_data)
                 
         except Exception as e:
             self.logger.error(f"Error processing trade execution: {e}")
-    
-    def _record_trade_close(self, trade_data: Dict[str, Any]) -> None:
+
+    def _record_completed_trade(self, symbol: str, side: str, entry_price: float, exit_price: float, 
+                              quantity: float, entry_time: int, exit_time: int, pnl: float, 
+                              pnl_pct: float, exit_reason: str, commission: float) -> None:
         """
         Record a completed trade.
-        
-        Args:
-            trade_data: Trade execution data
         """
         try:
-            # Get entry data from Redis (stored by execution manager)
-            symbol = trade_data['symbol']
-            entry_key_pattern = f"execution:{symbol}:*"
-            
-            # Find corresponding entry trade
-            entry_data = self._find_entry_trade(symbol, trade_data['timestamp'])
-            
-            if entry_data:
-                # Calculate trade metrics
-                side = trade_data['side']
-                entry_price = entry_data['price']
-                exit_price = trade_data['price']
-                quantity = trade_data['quantity']
-                
-                # Calculate PnL
-                if side == 'BUY':  # Closing a long position
-                    pnl = (exit_price - entry_price) * quantity
-                    pnl_pct = (exit_price - entry_price) / entry_price
-                else:  # Closing a short position
-                    pnl = (entry_price - exit_price) * quantity
-                    pnl_pct = (entry_price - exit_price) / exit_price
-                
-                # Calculate Fees and Net PnL
-                entry_commission = float(entry_data.get('commission', 0.0))
-                exit_commission = float(trade_data.get('commission', 0.0))
-                total_commission = entry_commission + exit_commission
-                net_pnl = pnl - total_commission
+            # Calculate Net PnL (simplified commission handling)
+            # Assuming commission is passed for the exit trade. 
+            # Ideally we should track entry commission too, but for now let's use what we have.
+            net_pnl = pnl - commission
 
-                # Create trade record
-                trade_record = TradeRecord(
-                    symbol=symbol,
-                    side=side,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    quantity=quantity,
-                    entry_time=entry_data['timestamp'],
-                    exit_time=trade_data['timestamp'],
-                    pnl=pnl,
-                    pnl_percentage=pnl_pct * 100,
-                    duration_seconds=(trade_data['timestamp'] - entry_data['timestamp']) // 1000,
-                    exit_reason=trade_data['type'],
-                    commission=total_commission,
-                    net_pnl=net_pnl
-                )
-                
-                # Add to records
-                self.trade_records.append(trade_record)
-                
-                # Limit memory usage
-                if len(self.trade_records) > self.max_trades_memory:
-                    self.trade_records = self.trade_records[-self.max_trades_memory:]
-                
-                # Update daily PnL
-                self._update_daily_pnl(trade_record)
-                
-                # Store in Redis
-                self._store_trade_record(trade_record)
-                
-                self.logger.info(f"Recorded trade: {symbol} PnL=${pnl:.2f} ({pnl_pct*100:.2f}%)")
-                
-        except Exception as e:
-            self.logger.error(f"Error recording trade close: {e}")
-    
-    def _find_entry_trade(self, symbol: str, exit_time: int) -> Optional[Dict[str, Any]]:
-        """
-        Find the corresponding entry trade for a closing trade.
-        
-        Args:
-            symbol: Trading symbol
-            exit_time: Exit timestamp
+            # Create trade record
+            trade_record = TradeRecord(
+                symbol=symbol,
+                side=side,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                quantity=quantity,
+                entry_time=entry_time,
+                exit_time=exit_time,
+                pnl=pnl,
+                pnl_percentage=pnl_pct * 100,
+                duration_seconds=(exit_time - entry_time) // 1000,
+                exit_reason=exit_reason,
+                commission=commission,
+                net_pnl=net_pnl
+            )
             
-        Returns:
-            Entry trade data or None
-        """
-        try:
-            # Look for recent entry trades in Redis
-            keys = self.redis_manager.get_keys(f"execution:{symbol}:*")
+            # Add to records
+            self.trade_records.append(trade_record)
             
-            # Sort by timestamp and find the most recent entry before exit
-            entry_candidates = []
-            for key in keys:
-                data = self.redis_manager.get_data(key)
-                if data and data.get('type') == 'FILLED':
-                    if data['timestamp'] < exit_time:
-                        entry_candidates.append(data)
+            # Limit memory usage
+            if len(self.trade_records) > self.max_trades_memory:
+                self.trade_records = self.trade_records[-self.max_trades_memory:]
             
-            # Return most recent entry
-            if entry_candidates:
-                return max(entry_candidates, key=lambda x: x['timestamp'])
+            # Update daily PnL
+            self._update_daily_pnl(trade_record)
             
-            return None
+            # Store in Redis
+            self._store_trade_record(trade_record)
+
+            # Publish fresh aggregate metrics immediately so the dashboard updates
+            # without waiting for the periodic report interval.
+            self._generate_performance_report()
+            
+            self.logger.info(f"Recorded trade: {symbol} PnL=${pnl:.2f} ({pnl_pct*100:.2f}%)")
             
         except Exception as e:
-            self.logger.error(f"Error finding entry trade for {symbol}: {e}")
-            return None
+            self.logger.error(f"Error recording completed trade: {e}")
     
     def _update_daily_pnl(self, trade_record: TradeRecord) -> None:
         """

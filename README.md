@@ -265,6 +265,12 @@ Rebuilds and restarts the Docker containers in detached mode.
 docker-compose down && docker-compose up -d --build
 ```
 
+**4. Download Logs from Server**
+Downloads specific log files from the remote server to the local download directory.
+```bash
+scp -i /Users/yizhuowang/Documents/dev/keys/HeliosBot_key.pem azureuser@20.39.199.2:~/Helios/logs/{helios_2025-12-20_15-12-21.log,decisions_2025-12-21.csv} ./logs/download/
+```
+
 ## 📊 System Components
 
 ### Data Ingestor

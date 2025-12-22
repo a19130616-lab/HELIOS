@@ -151,9 +151,38 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({'error': str(e)}).encode())
     
+    def _get_system_version(self) -> str:
+        """Get system version from config or environment."""
+        try:
+            # 1. Try Config
+            config = get_config()
+            version = config.get('system', 'version', fallback=None)
+            if version:
+                return str(version)
+            
+            # 2. Try Environment Variable
+            env_version = os.environ.get('HELIOS_VERSION')
+            if env_version:
+                return env_version
+                
+            # 3. Fallback to file timestamp
+            file_path = os.path.abspath(__file__)
+            timestamp = os.path.getmtime(file_path)
+            dt = datetime.fromtimestamp(timestamp)
+            return f"Dev-{dt.strftime('%Y%m%d-%H%M')}"
+        except Exception:
+            return "Unknown"
+
     def _serve_dashboard(self):
         """Serve the main dashboard HTML."""
         html_content = self._generate_dashboard_html()
+        
+        # Inject version info
+        version = self._get_system_version()
+        html_content = html_content.replace(
+            '<p>Real-time Health Dashboard</p>', 
+            f'<p>Real-time Health Dashboard <span class="small" style="color:#8b949e; margin-left:10px;">(Build: {version})</span></p>'
+        )
         
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
@@ -467,67 +496,124 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
                     recent_trades = []
 
             # Augment with open positions (unrealized PnL)
-            # NOTE: In LIVE mode, DecisionLogger's open_positions are simulated and can be misleading.
-            # Only display them in public/synthetic modes unless explicitly enabled.
-            show_simulated_positions = mode in ('public', 'synthetic')
-            try:
-                cfg = get_config()
-                show_simulated_positions = bool(
-                    show_simulated_positions or
-                    cfg.get('dashboard', 'show_simulated_positions_in_live', bool, fallback=False)
-                )
-            except Exception:
-                pass
-
-            open_positions = (self.redis_manager.get_data('open_positions') or {}) if show_simulated_positions else {}
+            # LIVE mode: show REAL exchange positions from RiskManager-published real_account_info.
+            # public/synthetic: show simulated DecisionLogger open_positions.
             unrealized_total = 0.0
             enriched_positions = []
             now = get_timestamp()
 
-            for sym, pos in open_positions.items():
-                direction = pos.get('direction')
-                entry_price = float(pos.get('entry_price', 0.0) or 0.0)
-                size = float(pos.get('size', 0.0) or 0.0)
-                opened_ts = int(pos.get('timestamp', now))
+            real_account_info = self.redis_manager.get_data('real_account_info')
 
-                current_price = None
-                sym_upper = sym.upper()
-                trade_data = self.redis_manager.get_data(f"trade:{sym_upper}")
-                if trade_data and 'price' in trade_data:
-                    current_price = trade_data.get('price')
-                    price_ts = trade_data.get('timestamp') or trade_data.get('ts')
-                if current_price is None:
-                    ob_data = self.redis_manager.get_data(f"orderbook:{sym_upper}")
-                    if ob_data and ob_data.get('mid_price') is not None:
-                        current_price = ob_data.get('mid_price')
-                        price_ts = ob_data.get('timestamp') or ob_data.get('ts')
+            if mode == 'live' and real_account_info and isinstance(real_account_info.get('positions'), list):
+                for p in real_account_info.get('positions') or []:
+                    try:
+                        sym_upper = str(p.get('symbol') or '').upper()
+                        if not sym_upper:
+                            continue
 
-                if current_price is None:
-                    continue  # cannot evaluate
+                        side = str(p.get('side') or '').upper()
+                        direction = 'LONG' if side == 'BUY' else 'SHORT' if side == 'SELL' else 'UNKNOWN'
 
+                        entry_price = float(p.get('entry_price', 0.0) or 0.0)
+                        size = float(p.get('size', 0.0) or 0.0)
+                        cp = float(p.get('current_price', 0.0) or 0.0)
+                        opened_ts = int(p.get('timestamp', now) or now)
+
+                        # Fallback to latest trade/orderbook if current_price missing
+                        if cp <= 0:
+                            trade_data = self.redis_manager.get_data(f"trade:{sym_upper}")
+                            if trade_data and trade_data.get('price') is not None:
+                                try:
+                                    cp = float(trade_data.get('price'))
+                                except Exception:
+                                    cp = 0.0
+                        if cp <= 0:
+                            ob_data = self.redis_manager.get_data(f"orderbook:{sym_upper}")
+                            if ob_data and ob_data.get('mid_price') is not None:
+                                try:
+                                    cp = float(ob_data.get('mid_price'))
+                                except Exception:
+                                    cp = 0.0
+
+                        if cp <= 0 or size <= 0:
+                            continue
+
+                        if direction == 'LONG':
+                            unrealized = (cp - entry_price) * size
+                        elif direction == 'SHORT':
+                            unrealized = (entry_price - cp) * size
+                        else:
+                            unrealized = float(p.get('unrealized_pnl', 0.0) or 0.0)
+
+                        unrealized_total += unrealized
+                        age_ms = now - opened_ts
+                        enriched_positions.append({
+                            'symbol': sym_upper,
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'current_price': cp,
+                            'size': size,
+                            'unrealized_pnl': unrealized,
+                            'age_ms': age_ms
+                        })
+                    except Exception:
+                        continue
+            else:
+                # NOTE: In LIVE mode, DecisionLogger's open_positions are simulated and can be misleading.
+                # Only display them in public/synthetic modes unless explicitly enabled.
+                show_simulated_positions = mode in ('public', 'synthetic')
                 try:
-                    cp = float(current_price)
+                    cfg = get_config()
+                    show_simulated_positions = bool(
+                        show_simulated_positions or
+                        cfg.get('dashboard', 'show_simulated_positions_in_live', bool, fallback=False)
+                    )
                 except Exception:
-                    continue
+                    pass
 
-                if direction == 'LONG':
-                    unrealized = (cp - entry_price) * size
-                elif direction == 'SHORT':
-                    unrealized = (entry_price - cp) * size
-                else:
-                    unrealized = 0.0
+                open_positions = (self.redis_manager.get_data('open_positions') or {}) if show_simulated_positions else {}
+                for sym, pos in open_positions.items():
+                    direction = pos.get('direction')
+                    entry_price = float(pos.get('entry_price', 0.0) or 0.0)
+                    size = float(pos.get('size', 0.0) or 0.0)
+                    opened_ts = int(pos.get('timestamp', now))
 
-                unrealized_total += unrealized
-                age_ms = now - opened_ts
-                enriched_positions.append({
-                    'symbol': sym_upper,
-                    'direction': direction,
-                    'entry_price': entry_price,
-                    'current_price': cp,
-                    'size': size,
-                    'unrealized_pnl': unrealized,
-                    'age_ms': age_ms
-                })
+                    current_price = None
+                    sym_upper = sym.upper()
+                    trade_data = self.redis_manager.get_data(f"trade:{sym_upper}")
+                    if trade_data and 'price' in trade_data:
+                        current_price = trade_data.get('price')
+                    if current_price is None:
+                        ob_data = self.redis_manager.get_data(f"orderbook:{sym_upper}")
+                        if ob_data and ob_data.get('mid_price') is not None:
+                            current_price = ob_data.get('mid_price')
+
+                    if current_price is None:
+                        continue  # cannot evaluate
+
+                    try:
+                        cp = float(current_price)
+                    except Exception:
+                        continue
+
+                    if direction == 'LONG':
+                        unrealized = (cp - entry_price) * size
+                    elif direction == 'SHORT':
+                        unrealized = (entry_price - cp) * size
+                    else:
+                        unrealized = 0.0
+
+                    unrealized_total += unrealized
+                    age_ms = now - opened_ts
+                    enriched_positions.append({
+                        'symbol': sym_upper,
+                        'direction': direction,
+                        'entry_price': entry_price,
+                        'current_price': cp,
+                        'size': size,
+                        'unrealized_pnl': unrealized,
+                        'age_ms': age_ms
+                    })
 
             realized_gross = float(performance.get('total_pnl', 0.0)) if performance else 0.0
             # Use net_pnl for equity calculation if available, otherwise fallback to gross (legacy behavior)
@@ -547,7 +633,6 @@ class HealthDashboardHandler(BaseHTTPRequestHandler):
             performance['account_value'] = starting_balance + performance.get('total_equity_pnl', 0.0)
 
             # Try to get real account info from Redis (published by RiskManager)
-            real_account_info = self.redis_manager.get_data('real_account_info')
             if real_account_info:
                 performance['account_value'] = float(real_account_info.get('total_balance', performance['account_value']))
                 performance['available_balance'] = float(real_account_info.get('available_balance', 0.0))
