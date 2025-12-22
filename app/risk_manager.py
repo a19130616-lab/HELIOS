@@ -355,7 +355,7 @@ class RiskManager:
         else:
             return current_price >= position.stop_loss
     
-    def _calculate_initial_stop_loss(self, symbol: str, entry_price: float, side: OrderSide) -> float:
+    def _calculate_initial_stop_loss(self, symbol: str, entry_price: float, side: OrderSide) -> Optional[float]:
         """
         Calculate initial stop loss based on ATR.
         
@@ -368,6 +368,10 @@ class RiskManager:
             Stop loss price
         """
         try:
+            entry_price = float(entry_price or 0.0)
+            if entry_price <= 0:
+                return None
+
             # Handle no API client (public or synthetic mode)
             if self.api_client is None:
                 # Use default 1% stop loss when no API client
@@ -386,7 +390,10 @@ class RiskManager:
                     closes = [float(kline[4]) for kline in klines]
                     
                     atr = calculate_atr(highs, lows, closes)
-                    multiplier = atr / entry_price * self.trailing_stop_atr_multiple
+                    if entry_price <= 0:
+                        multiplier = 0.01
+                    else:
+                        multiplier = atr / entry_price * self.trailing_stop_atr_multiple
                     
                     # Ensure reasonable bounds (0.5% to 3%)
                     multiplier = max(0.005, min(0.03, multiplier))
@@ -399,9 +406,15 @@ class RiskManager:
         except Exception as e:
             self.logger.error(f"Error calculating stop loss for {symbol}: {e}")
             # Fallback stop loss
-            return entry_price * (0.99 if side == OrderSide.BUY else 1.01)
+            try:
+                entry_price_f = float(entry_price or 0.0)
+            except Exception:
+                entry_price_f = 0.0
+            if entry_price_f <= 0:
+                return None
+            return entry_price_f * (0.99 if side == OrderSide.BUY else 1.01)
 
-    def calculate_take_profit(self, symbol: str, entry_price: float, side: OrderSide) -> float:
+    def calculate_take_profit(self, symbol: str, entry_price: float, side: OrderSide) -> Optional[float]:
         """
         Calculate take profit price based on ATR or fixed percentage.
         Targeting 1:2 Risk:Reward ratio.
@@ -415,6 +428,10 @@ class RiskManager:
             Take profit price
         """
         try:
+            entry_price = float(entry_price or 0.0)
+            if entry_price <= 0:
+                return None
+
             # Handle no API client (public or synthetic mode)
             if self.api_client is None:
                 multiplier = 0.02 # 2% default target
@@ -434,6 +451,8 @@ class RiskManager:
                     
                     # Calculate multiplier based on ATR/Price ratio
                     # Target 4 ATR for TP (assuming SL is around 2 ATR)
+                    if entry_price <= 0:
+                        return None
                     atr_pct = atr / entry_price
                     multiplier = atr_pct * 4.0
             
@@ -448,10 +467,16 @@ class RiskManager:
         except Exception as e:
             self.logger.error(f"Error calculating take profit for {symbol}: {e}")
             # Fallback to 2%
+            try:
+                entry_price_f = float(entry_price or 0.0)
+            except Exception:
+                entry_price_f = 0.0
+            if entry_price_f <= 0:
+                return None
             if side == OrderSide.BUY:
-                return entry_price * 1.02
+                return entry_price_f * 1.02
             else:
-                return entry_price * 0.98
+                return entry_price_f * 0.98
     
     def _update_trailing_stop(self, position: Position) -> None:
         """
@@ -462,6 +487,12 @@ class RiskManager:
         """
         try:
             current_price = position.current_price
+
+            # Initialize missing watermark on first update (can happen for synced positions).
+            if position.high_water_mark is None:
+                position.high_water_mark = float(current_price or 0.0)
+                if position.high_water_mark <= 0:
+                    return
             
             # Update high water mark
             if position.side == OrderSide.BUY:

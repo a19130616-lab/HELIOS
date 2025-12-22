@@ -83,7 +83,7 @@ class ExecutionManager:
                 self.config.get('risk', 'stop_loss_limit_slippage_pct', float, fallback=0.01)
             )
         except Exception:
-            self.stop_loss_limit_slippage_pct = 0.01
+            self.stop_loss_limit_slippage_pct = 0.015
 
         try:
             self.stop_loss_replace_after_sec = int(
@@ -588,12 +588,53 @@ class ExecutionManager:
             try:
                 # Fetch trades associated with this order to get commission
                 trades = self.api_client.get_account_trades(symbol=symbol, orderId=order_id)
+                # Some Binance responses can return avgPrice=0 even for filled orders.
+                # Reconstruct VWAP from fills if possible.
+                try:
+                    if (avg_price is None) or (float(avg_price) <= 0.0):
+                        total_qty = 0.0
+                        total_quote = 0.0
+                        for t in trades or []:
+                            q = float(t.get('qty') or t.get('quantity') or 0.0)
+                            p = float(t.get('price') or 0.0)
+                            if q > 0 and p > 0:
+                                total_qty += q
+                                total_quote += q * p
+                        if total_qty > 0:
+                            avg_price = total_quote / total_qty
+                except Exception:
+                    pass
+
                 for trade in trades:
                     commission += float(trade.get('commission', 0.0))
                     commission_asset = trade.get('commissionAsset', commission_asset)
                 self.logger.info(f"Order {order_id} commission: {commission} {commission_asset}")
             except Exception as e:
                 self.logger.error(f"Error fetching commission for order {order_id}: {e}")
+
+            # Final fallback for avg_price if still invalid
+            try:
+                if (avg_price is None) or (float(avg_price) <= 0.0):
+                    cq = order.get('cummulativeQuoteQty') or order.get('cumQuote')
+                    if cq is not None and filled_qty > 0:
+                        avg_price = float(cq) / float(filled_qty)
+            except Exception:
+                pass
+
+            if avg_price is None or float(avg_price) <= 0.0:
+                self.logger.error(f"Filled order has invalid avg_price for {symbol} (orderId={order_id}). Skipping position/TP setup.")
+                # Clean up active order tracking to avoid deadlocks
+                try:
+                    del self.active_orders[order_id]
+                except Exception:
+                    pass
+                if symbol in self.pending_signals:
+                    try:
+                        del self.pending_signals[symbol]
+                    except Exception:
+                        pass
+                self.execution_errors += 1
+                return
             
             # Add position to risk manager
             self.risk_manager.add_position(
@@ -625,7 +666,7 @@ class ExecutionManager:
                         if self._is_hedge_mode():
                             sl_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
                         else:
-                            sl_params["reduceOnly"] = "true"
+                            sl_params["reduceOnly"] = True
 
                         self.logger.info(
                             f"Placing Exchange SL (Stop Market) for {symbol} at {sl_params['stopPrice']}"
@@ -640,21 +681,42 @@ class ExecutionManager:
                         tp_price = self.risk_manager.calculate_take_profit(symbol, avg_price, order_info['order_side'])
 
                         if tp_price:
+                            # ReduceOnly exits must not exceed actual position size.
+                            tp_qty = self._format_quantity(symbol, filled_qty, rounding="down")
+                            if tp_qty > float(filled_qty):
+                                tp_qty = self._format_quantity(symbol, float(filled_qty) * 0.999, rounding="down")
+                            if tp_qty <= 0:
+                                raise ValueError(f"TP quantity formatted to 0 for {symbol} (filled_qty={filled_qty})")
+
                             tp_params = {
                                 "symbol": symbol,
                                 "side": exit_side,
                                 "type": "LIMIT",
                                 "price": self._format_price(symbol, tp_price),
-                                "quantity": self._format_quantity(symbol, filled_qty),
+                                "quantity": tp_qty,
                                 "timeInForce": "GTC",
                             }
                             if self._is_hedge_mode():
                                 tp_params["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
                             else:
-                                tp_params["reduceOnly"] = "true"
+                                tp_params["reduceOnly"] = True
 
                             self.logger.info(f"Placing Exchange TP (Maker) for {symbol} at {tp_params['price']}")
-                            tp_order = self.api_client.new_order(**tp_params)
+                            try:
+                                tp_order = self.api_client.new_order(**tp_params)
+                            except ClientError as ce:
+                                # Common failure: account is in Hedge Mode but our detection returned False,
+                                # causing reduceOnly to be rejected (-2022). Retry with positionSide.
+                                if ("-2022" in str(ce)) and ("reduceonly" in str(ce).lower()):
+                                    retry = dict(tp_params)
+                                    retry.pop("reduceOnly", None)
+                                    retry["positionSide"] = "LONG" if order_info['order_side'] == OrderSide.BUY else "SHORT"
+                                    self.logger.warning(
+                                        f"TP reduceOnly rejected for {symbol}; retrying with positionSide={retry['positionSide']}"
+                                    )
+                                    tp_order = self.api_client.new_order(**retry)
+                                else:
+                                    raise
 
                             # Track TP order for execution logging
                             if tp_order and 'orderId' in tp_order:
