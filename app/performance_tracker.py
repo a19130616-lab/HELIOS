@@ -44,6 +44,7 @@ class PerformanceMetrics:
     total_pnl: float
     total_fees: float
     net_pnl: float
+    roi_pct: float
     total_pnl_percentage: float
     average_win: float
     average_loss: float
@@ -88,6 +89,9 @@ class PerformanceTracker:
         self.start_time = get_timestamp()
         self.open_positions = {} # symbol -> position_data
 
+        # Baseline used for ROI% reporting (net-of-fees). Prefer live account total_balance if available.
+        self.roi_baseline_balance: float = 0.0
+
         # NOTE: Trade execution subscription must be started after `start()` sets
         # `is_running=True`. Otherwise the subscription thread can exit immediately
         # and never process executions.
@@ -108,6 +112,21 @@ class PerformanceTracker:
         self.portfolio_value_history = []
         self.peak_portfolio_value = 0.0
         self.start_time = get_timestamp()
+        self.open_positions = {}
+
+        # Determine ROI baseline balance for this session.
+        baseline_balance = 0.0
+        try:
+            real_info = self.redis_manager.get_data("real_account_info") or {}
+            baseline_balance = float(real_info.get("total_balance") or 0.0)
+        except Exception:
+            baseline_balance = 0.0
+        if baseline_balance <= 0:
+            try:
+                baseline_balance = float(self.config.get('simulation', 'starting_balance', fallback='10000'))
+            except Exception:
+                baseline_balance = 10000.0
+        self.roi_baseline_balance = baseline_balance
 
         # Fresh session: intentionally DO NOT load historical trade_records so that
         # performance metrics reflect only the current runtime.
@@ -129,6 +148,7 @@ class PerformanceTracker:
             total_pnl=0.0,
             total_fees=0.0,
             net_pnl=0.0,
+            roi_pct=0.0,
             total_pnl_percentage=0.0,
             average_win=0.0,
             average_loss=0.0,
@@ -148,6 +168,7 @@ class PerformanceTracker:
         baseline_dict['max_drawdown_pct'] = baseline.max_drawdown
         # Add explicit session start marker
         baseline_dict['session_start_ts'] = self.start_time
+        baseline_dict['roi_baseline_balance'] = self.roi_baseline_balance
         try:
             self.redis_manager.set_data("performance_metrics", baseline_dict, expiry=3600)
             self.redis_manager.publish("performance_updates", baseline_dict)
@@ -225,12 +246,21 @@ class PerformanceTracker:
                     total_quantity = position['quantity'] + quantity
                     position['price'] = total_cost / total_quantity
                     position['quantity'] = total_quantity
+                    position['commission'] = float(position.get('commission', 0.0)) + commission
                     self.logger.info(f"Updated position for {symbol}: Increased size to {total_quantity}")
                 
                 # Trade is in opposite direction (Closing/Reducing position)
                 else:
                     # Calculate PnL on the portion being closed
                     close_quantity = min(quantity, position['quantity'])
+
+                    # Allocate entry commissions pro-rata to this close.
+                    # Track remaining commissions on the open position for partial closes.
+                    position_qty_before = float(position['quantity'])
+                    position_commission_before = float(position.get('commission', 0.0))
+                    entry_commission_alloc = 0.0
+                    if position_qty_before > 0 and position_commission_before > 0:
+                        entry_commission_alloc = position_commission_before * (close_quantity / position_qty_before)
                     
                     if position['side'] == 'BUY': # Long position, Selling to close
                         pnl = (price - position['price']) * close_quantity
@@ -251,13 +281,15 @@ class PerformanceTracker:
                         pnl=pnl,
                         pnl_pct=pnl_pct,
                         exit_reason=trade_data['type'],
-                        commission=commission
+                        commission=(entry_commission_alloc + commission)
                     )
                     
                     # Update remaining position
                     remaining_quantity = position['quantity'] - close_quantity
                     if remaining_quantity > 0.00000001: # Float tolerance
                         position['quantity'] = remaining_quantity
+                        if entry_commission_alloc > 0:
+                            position['commission'] = max(0.0, position_commission_before - entry_commission_alloc)
                         self.logger.info(f"Updated position for {symbol}: Reduced size to {remaining_quantity}")
                     else:
                         del self.open_positions[symbol]
@@ -270,7 +302,8 @@ class PerformanceTracker:
                     'side': side,
                     'price': price,
                     'quantity': quantity,
-                    'timestamp': timestamp
+                    'timestamp': timestamp,
+                    'commission': commission,
                 }
                 self.logger.info(f"Opened new position tracking for {symbol} {side} @ {price}")
 
@@ -287,9 +320,7 @@ class PerformanceTracker:
         Record a completed trade.
         """
         try:
-            # Calculate Net PnL (simplified commission handling)
-            # Assuming commission is passed for the exit trade. 
-            # Ideally we should track entry commission too, but for now let's use what we have.
+            # Calculate Net PnL (fees included): commission passed in is total fees allocated to this trade.
             net_pnl = pnl - commission
 
             # Create trade record
@@ -363,8 +394,10 @@ class PerformanceTracker:
             
             # Estimate portfolio value (this would be replaced with actual account value)
             total_net_pnl = sum(record.net_pnl for record in self.trade_records)
-            starting_balance = float(self.config.get('simulation', 'starting_balance', fallback='10000'))
-            estimated_value = starting_balance + total_net_pnl
+            baseline = float(self.roi_baseline_balance or 0.0)
+            if baseline <= 0:
+                baseline = float(self.config.get('simulation', 'starting_balance', fallback='10000'))
+            estimated_value = baseline + total_net_pnl
             
             # Update tracking
             self.portfolio_value_history.append((current_time, estimated_value))
@@ -478,7 +511,7 @@ class PerformanceTracker:
         if not self.trade_records:
             return PerformanceMetrics(
                 total_trades=0, winning_trades=0, losing_trades=0, win_rate=0.0,
-                total_pnl=0.0, total_fees=0.0, net_pnl=0.0, total_pnl_percentage=0.0, average_win=0.0, average_loss=0.0,
+                total_pnl=0.0, total_fees=0.0, net_pnl=0.0, roi_pct=0.0, total_pnl_percentage=0.0, average_win=0.0, average_loss=0.0,
                 largest_win=0.0, largest_loss=0.0, profit_factor=0.0, sharpe_ratio=0.0,
                 max_drawdown=0.0, current_drawdown=0.0, average_trade_duration=0.0,
                 trades_per_day=0.0, start_time=self.start_time, end_time=get_timestamp()
@@ -497,6 +530,14 @@ class PerformanceTracker:
         total_fees = sum(t.commission for t in self.trade_records)
         net_pnl = total_pnl - total_fees
         total_pnl_percentage = sum(t.pnl_percentage for t in self.trade_records)
+
+        baseline = float(self.roi_baseline_balance or 0.0)
+        if baseline <= 0:
+            try:
+                baseline = float(self.config.get('simulation', 'starting_balance', fallback='10000'))
+            except Exception:
+                baseline = 10000.0
+        roi_pct = (net_pnl / baseline) * 100 if baseline > 0 else 0.0
         
         # Win/Loss averages
         wins = [t.pnl for t in self.trade_records if t.pnl > 0]
@@ -541,6 +582,7 @@ class PerformanceTracker:
             total_pnl=total_pnl,
             total_fees=total_fees,
             net_pnl=net_pnl,
+            roi_pct=roi_pct,
             total_pnl_percentage=total_pnl_percentage,
             average_win=average_win,
             average_loss=average_loss,

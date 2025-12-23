@@ -35,6 +35,21 @@ use_10m_mode = false
 ml_model_path = ./models/xgb_model.json
 ml_confidence_threshold = 0.75
 
+# Best-ROI confirmation gate (preferred over deprecated 10m mode):
+# Require N triggers in the same direction within a rolling time window before emitting a signal.
+confirm_required = 2
+confirm_window_sec = 120
+confirm_max_events = 6
+
+# Minimum time between emitted signals per symbol (ms)
+min_signal_interval_ms = 120000
+
+# Best-ROI regime gate: avoid trading when the market is detected as ranging/choppy.
+# Helps reduce flip churn and stop-loss whipsaws. Default off.
+avoid_ranging_regime = false
+# Market regime classifier tuning: EMA separation threshold (fraction, e.g. 0.02 = 2%).
+market_regime_ema_diff_threshold = 0.02
+
 [risk]
 kelly_fraction = 0.5
 trailing_stop_atr_multiple = 1.5

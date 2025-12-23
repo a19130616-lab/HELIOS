@@ -1069,10 +1069,11 @@ class ExecutionManager:
             order_id: Order ID
         """
         try:
-            if order_id not in self.monitored_exits:
+            # NOTE: monitored_exits can be modified by other threads (e.g., stop-loss replacement).
+            # Use get() to avoid a KeyError race where the exception message becomes the order_id.
+            exit_info = self.monitored_exits.get(order_id)
+            if not exit_info:
                 return
-            
-            exit_info = self.monitored_exits[order_id]
             symbol = exit_info['symbol']
             
             # Query order status
@@ -1108,8 +1109,8 @@ class ExecutionManager:
                 
                 self.logger.info(f"Exit order {order_id} filled for {symbol}")
                 
-                # Remove from monitored exits
-                del self.monitored_exits[order_id]
+                # Remove from monitored exits (safe if another thread already cleaned it)
+                self.monitored_exits.pop(order_id, None)
                 
                 # Update RiskManager
                 self.risk_manager.remove_position(symbol, avg_price, str(exit_type))
@@ -1154,7 +1155,7 @@ class ExecutionManager:
 
             elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
                 exit_type = exit_info.get('type') or ''
-                del self.monitored_exits[order_id]
+                self.monitored_exits.pop(order_id, None)
 
                 if str(exit_type) == 'FLIP_EXIT':
                     flip_signal = self.pending_flips.pop(symbol, None)
@@ -1183,7 +1184,7 @@ class ExecutionManager:
                                 )
                     except Exception:
                         pass
-                    del self.monitored_exits[order_id]
+                    self.monitored_exits.pop(order_id, None)
     
     def _check_stop_loss(self, symbol: str) -> None:
         """
