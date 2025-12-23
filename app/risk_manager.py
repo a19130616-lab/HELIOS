@@ -56,6 +56,44 @@ class RiskManager:
         # Emergency state
         self.emergency_mode = False
         self.last_emergency_action = 0
+
+        # Stop-loss behavior tuning (reduce whipsaw + allow TP more room)
+        try:
+            self.stop_loss_min_pct = float(self.config.get('risk', 'stop_loss_min_pct', float, fallback=0.01))
+        except Exception:
+            self.stop_loss_min_pct = 0.01
+
+        try:
+            self.stop_loss_max_pct = float(self.config.get('risk', 'stop_loss_max_pct', float, fallback=0.05))
+        except Exception:
+            self.stop_loss_max_pct = 0.05
+
+        # Only start trailing once position is in profit by this %.
+        try:
+            self.trailing_stop_activation_profit_pct = float(
+                self.config.get('risk', 'trailing_stop_activation_profit_pct', float, fallback=0.005)
+            )
+        except Exception:
+            self.trailing_stop_activation_profit_pct = 0.005
+
+        # Require stop breach to exceed stop by a small buffer to avoid wicks.
+        try:
+            self.stop_loss_trigger_buffer_pct = float(
+                self.config.get('risk', 'stop_loss_trigger_buffer_pct', float, fallback=0.0005)
+            )
+        except Exception:
+            self.stop_loss_trigger_buffer_pct = 0.0005
+
+        # Require stop breach to persist for N seconds before triggering.
+        try:
+            self.stop_loss_trigger_confirm_sec = int(
+                self.config.get('risk', 'stop_loss_trigger_confirm_sec', int, fallback=2)
+            )
+        except Exception:
+            self.stop_loss_trigger_confirm_sec = 2
+
+        # symbol -> first timestamp (ms) when stop was breached (buffer-adjusted)
+        self._stop_breach_start_ms: Dict[str, int] = {}
         
     def start(self) -> None:
         """Start the risk management system."""
@@ -349,11 +387,34 @@ class RiskManager:
         if position.stop_loss is None:
             return False
         
-        # Check stop loss trigger
+        # Check stop loss trigger with buffer + confirm time (reduces whipsaw on 1s polling).
+        now = get_timestamp()
+        sl = float(position.stop_loss)
+        px = float(current_price)
+
         if position.side == OrderSide.BUY:
-            return current_price <= position.stop_loss
+            trigger_level = sl * (1.0 - float(self.stop_loss_trigger_buffer_pct or 0.0))
+            breached = px <= trigger_level
         else:
-            return current_price >= position.stop_loss
+            trigger_level = sl * (1.0 + float(self.stop_loss_trigger_buffer_pct or 0.0))
+            breached = px >= trigger_level
+
+        if not breached:
+            # Reset breach timer if price recovers
+            if symbol in self._stop_breach_start_ms:
+                del self._stop_breach_start_ms[symbol]
+            return False
+
+        confirm_ms = max(0, int(self.stop_loss_trigger_confirm_sec or 0) * 1000)
+        if confirm_ms <= 0:
+            return True
+
+        start = self._stop_breach_start_ms.get(symbol)
+        if start is None:
+            self._stop_breach_start_ms[symbol] = now
+            return False
+
+        return (now - int(start)) >= confirm_ms
     
     def _calculate_initial_stop_loss(self, symbol: str, entry_price: float, side: OrderSide) -> Optional[float]:
         """
@@ -395,8 +456,10 @@ class RiskManager:
                     else:
                         multiplier = atr / entry_price * self.trailing_stop_atr_multiple
                     
-                    # Ensure reasonable bounds (0.5% to 3%)
-                    multiplier = max(0.005, min(0.03, multiplier))
+                    # Ensure reasonable bounds (configurable; default 1% to 5%)
+                    min_pct = float(self.stop_loss_min_pct or 0.01)
+                    max_pct = float(self.stop_loss_max_pct or 0.05)
+                    multiplier = max(min_pct, min(max_pct, multiplier))
             
             if side == OrderSide.BUY:
                 return entry_price * (1 - multiplier)
@@ -487,6 +550,18 @@ class RiskManager:
         """
         try:
             current_price = position.current_price
+
+            # Delay trailing activation until position has some profit; keeps stop from tightening too early.
+            entry_price = float(position.entry_price or 0.0)
+            if entry_price > 0 and self.trailing_stop_activation_profit_pct is not None:
+                threshold = float(self.trailing_stop_activation_profit_pct)
+                if threshold > 0:
+                    if position.side == OrderSide.BUY:
+                        profit_pct = (float(current_price) - entry_price) / entry_price
+                    else:
+                        profit_pct = (entry_price - float(current_price)) / entry_price
+                    if profit_pct < threshold:
+                        return
 
             # Initialize missing watermark on first update (can happen for synced positions).
             if position.high_water_mark is None:

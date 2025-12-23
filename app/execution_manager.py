@@ -97,6 +97,37 @@ class ExecutionManager:
             self.trading_cooldown_ms = self.config.get('trading', 'trading_cooldown_minutes', int, fallback=0) * 60 * 1000
         except Exception:
             self.trading_cooldown_ms = 0
+
+        # Optional: flip (close-then-open) when an opposite signal arrives while a position is open.
+        try:
+            raw_val = self.config.get('trading', 'flip_on_opposite_signal', fallback='false')
+            self.flip_on_opposite_signal = str(raw_val).lower() in ('1', 'true', 'yes', 'y')
+        except Exception:
+            self.flip_on_opposite_signal = False
+
+        # Flip execution tuning (reduce fees by trying maker first)
+        try:
+            raw_val = self.config.get('trading', 'flip_exit_post_only', fallback='true')
+            self.flip_exit_post_only = str(raw_val).lower() in ('1', 'true', 'yes', 'y')
+        except Exception:
+            self.flip_exit_post_only = True
+
+        try:
+            self.flip_exit_max_wait_sec = int(self.config.get('trading', 'flip_exit_max_wait_sec', int, fallback=4))
+        except Exception:
+            self.flip_exit_max_wait_sec = 4
+
+        try:
+            self.flip_exit_maker_offset_pct = float(
+                self.config.get('trading', 'flip_exit_maker_offset_pct', float, fallback=0.0001)
+            )
+        except Exception:
+            self.flip_exit_maker_offset_pct = 0.0001
+
+        try:
+            self.flip_min_interval_sec = int(self.config.get('trading', 'flip_min_interval_sec', int, fallback=20))
+        except Exception:
+            self.flip_min_interval_sec = 20
             
         # Execution state
         self.is_running = False
@@ -109,6 +140,9 @@ class ExecutionManager:
         self.active_orders = {}  # order_id -> order_info
         self.monitored_exits = {} # order_id -> {symbol, side, type, timestamp}
         self.pending_signals = {}  # symbol -> signal
+        # symbol -> pending flip signal (execute after FLIP_EXIT fills)
+        self.pending_flips: Dict[str, TradingSignal] = {}
+        self.last_flip_time: Dict[str, int] = {}
         self.last_trade_time = {}  # symbol -> timestamp_ms
 
         # Exchange metadata cache (precision/minNotional/stepSize)
@@ -244,6 +278,50 @@ class ExecutionManager:
         
         # Check if we already have a position in this symbol
         if signal.symbol in self.risk_manager.positions:
+            # If flips are enabled and the signal is opposite direction, submit a close-then-open.
+            if self.flip_on_opposite_signal:
+                try:
+                    if signal.symbol in self.pending_flips:
+                        self.logger.info(f"Ignoring signal for {signal.symbol} - flip already pending")
+                        self._record_signal_status(signal, execution_status="SKIPPED", execution_error="flip_already_pending")
+                        return False
+
+                    position = self.risk_manager.positions[signal.symbol]
+                    current_dir = SignalDirection.LONG if position.side == OrderSide.BUY else SignalDirection.SHORT
+                    if signal.direction == current_dir:
+                        self.logger.info(f"Ignoring signal for {signal.symbol} - same-direction position already open")
+                        self._record_signal_status(signal, execution_status="SKIPPED", execution_error="position_already_open_same_direction")
+                        return False
+
+                    self.logger.info(f"Flip requested for {signal.symbol}: closing then opening {signal.direction.value}")
+                    self._record_signal_status(signal, execution_status="FLIP_EXIT_SUBMITTING")
+
+                    # Prevent extremely rapid flip-churn in chop.
+                    now_ts = get_timestamp()
+                    last_flip = int(self.last_flip_time.get(signal.symbol, 0) or 0)
+                    if self.flip_min_interval_sec and (now_ts - last_flip) < int(self.flip_min_interval_sec) * 1000:
+                        self.logger.info(f"Ignoring flip for {signal.symbol} - flip_min_interval active")
+                        self._record_signal_status(signal, execution_status="SKIPPED", execution_error="flip_min_interval_active")
+                        return False
+
+                    flip_exit_order_id = self._submit_flip_close(signal.symbol)
+                    if not flip_exit_order_id:
+                        self._record_signal_status(signal, execution_status="FAILED", execution_error="flip_exit_submission_failed")
+                        return False
+
+                    self.pending_flips[signal.symbol] = signal
+                    self.last_flip_time[signal.symbol] = now_ts
+                    self._record_signal_status(
+                        signal,
+                        execution_status="FLIP_EXIT_PLACED",
+                        flip_exit_order_id=str(flip_exit_order_id),
+                    )
+                    return False
+                except Exception as e:
+                    self.logger.error(f"Error initiating flip for {signal.symbol}: {e}")
+                    self._record_signal_status(signal, execution_status="FAILED", execution_error=f"flip_init_error {e}")
+                    return False
+
             self.logger.info(f"Ignoring signal for {signal.symbol} - position already open")
             self._record_signal_status(signal, execution_status="SKIPPED", execution_error="position_already_open")
             return False
@@ -270,6 +348,149 @@ class ExecutionManager:
             return False
         
         return True
+
+    def _submit_flip_close(self, symbol: str) -> Optional[str]:
+        """Submit an aggressive reduce-only IOC LIMIT order to close an existing position.
+
+        Returns the new exit order id if placed.
+        """
+        try:
+            if symbol not in self.risk_manager.positions:
+                return None
+
+            position = self.risk_manager.positions[symbol]
+
+            # Determine order side (opposite of current position)
+            side = "SELL" if position.side == OrderSide.BUY else "BUY"
+
+            # Cancel any existing TP exits we are monitoring for this symbol.
+            for tp_order_id, info in list(self.monitored_exits.items()):
+                if info.get('symbol') == symbol and info.get('type') == 'TAKE_PROFIT':
+                    try:
+                        self.api_client.cancel_order(symbol=symbol, orderId=tp_order_id)
+                    except Exception:
+                        pass
+                    try:
+                        del self.monitored_exits[tp_order_id]
+                    except Exception:
+                        pass
+
+            # Format quantity (never exceed position size)
+            quantity = self._format_quantity(symbol, abs(position.size), rounding="down")
+            if quantity > abs(position.size):
+                quantity = self._format_quantity(symbol, abs(position.size) * 0.999, rounding="down")
+            if quantity <= 0:
+                return None
+
+            # Prefer post-only maker close (GTX) to reduce fees; fallback to IOC is handled in exit monitor.
+            ticker = self.api_client.ticker_price(symbol=symbol)
+            current_price = float(ticker['price'])
+            if self.flip_exit_post_only:
+                maker_off = float(self.flip_exit_maker_offset_pct)
+                if side == "SELL":
+                    # place on the ask side to be maker
+                    limit_price = current_price * (1 + maker_off)
+                else:
+                    # place on the bid side to be maker
+                    limit_price = current_price * (1 - maker_off)
+                tif = "GTX"
+            else:
+                slippage = float(self.stop_loss_limit_slippage_pct)
+                if side == "SELL":
+                    limit_price = current_price * (1 - slippage)
+                else:
+                    limit_price = current_price * (1 + slippage)
+                tif = "IOC"
+
+            params: Dict[str, Any] = {
+                "symbol": symbol,
+                "side": side,
+                "type": "LIMIT",
+                "timeInForce": tif,
+                "quantity": quantity,
+                "price": self._format_price(symbol, limit_price),
+            }
+
+            if self._is_hedge_mode():
+                params["positionSide"] = "LONG" if position.side == OrderSide.BUY else "SHORT"
+            else:
+                params["reduceOnly"] = "true"
+
+            order = self.api_client.new_order(**params)
+            if not (order and order.get('orderId')):
+                return None
+
+            oid = str(order['orderId'])
+            self.logger.info(
+                f"Flip close placed for {symbol}: orderId={oid} side={side} qty={quantity} price={params.get('price')} tif={tif}"
+            )
+            self.monitored_exits[oid] = {
+                'symbol': symbol,
+                'side': OrderSide(side),
+                'type': 'FLIP_EXIT',
+                'timestamp': get_timestamp(),
+                'tif': tif,
+            }
+            return oid
+        except Exception as e:
+            self.logger.error(f"Error submitting flip close for {symbol}: {e}")
+            return None
+
+    def _submit_flip_close_aggressive(self, symbol: str) -> Optional[str]:
+        """Aggressive fallback close for flip: IOC LIMIT that is likely to fill (taker-like)."""
+        try:
+            if symbol not in self.risk_manager.positions:
+                return None
+
+            position = self.risk_manager.positions[symbol]
+            side = "SELL" if position.side == OrderSide.BUY else "BUY"
+
+            quantity = self._format_quantity(symbol, abs(position.size), rounding="down")
+            if quantity > abs(position.size):
+                quantity = self._format_quantity(symbol, abs(position.size) * 0.999, rounding="down")
+            if quantity <= 0:
+                return None
+
+            ticker = self.api_client.ticker_price(symbol=symbol)
+            current_price = float(ticker['price'])
+            slippage = float(self.stop_loss_limit_slippage_pct)
+            if side == "SELL":
+                limit_price = current_price * (1 - slippage)
+            else:
+                limit_price = current_price * (1 + slippage)
+
+            params: Dict[str, Any] = {
+                "symbol": symbol,
+                "side": side,
+                "type": "LIMIT",
+                "timeInForce": "IOC",
+                "quantity": quantity,
+                "price": self._format_price(symbol, limit_price),
+            }
+            if self._is_hedge_mode():
+                params["positionSide"] = "LONG" if position.side == OrderSide.BUY else "SHORT"
+            else:
+                params["reduceOnly"] = "true"
+
+            order = self.api_client.new_order(**params)
+            if not (order and order.get('orderId')):
+                return None
+
+            oid = str(order['orderId'])
+            self.logger.warning(
+                f"Flip close escalated to IOC for {symbol}: orderId={oid} side={side} qty={quantity} price={params.get('price')}"
+            )
+            self.monitored_exits[oid] = {
+                'symbol': symbol,
+                'side': OrderSide(side),
+                'type': 'FLIP_EXIT',
+                'timestamp': get_timestamp(),
+                'tif': 'IOC',
+            }
+            return oid
+        except Exception as e:
+            self.logger.error(f"Error submitting aggressive flip close for {symbol}: {e}")
+            return None
 
     def _record_signal_status(self, signal: TradingSignal, **status_fields: Any) -> None:
         """Persist execution status for a signal so the dashboard can show live order outcomes."""
@@ -893,14 +1114,75 @@ class ExecutionManager:
                 # Update RiskManager
                 self.risk_manager.remove_position(symbol, avg_price, str(exit_type))
 
+                # If this fill was a flip close, immediately execute the pending opposite signal.
+                if str(exit_type) == 'FLIP_EXIT':
+                    flip_signal = self.pending_flips.pop(symbol, None)
+                    if flip_signal is not None:
+                        self.logger.info(f"Flip exit filled for {symbol}; executing pending opposite signal")
+                        self._record_signal_status(flip_signal, execution_status="FLIP_EXIT_FILLED")
+                        # Bypass _should_process_signal cooldown gating; we already closed.
+                        self._execute_signal(flip_signal)
+
+            elif str(exit_info.get('type') or '') == 'FLIP_EXIT' and status in ['NEW', 'PARTIALLY_FILLED']:
+                # If we tried a post-only flip close, give it a moment to fill as maker, then escalate.
+                try:
+                    tif = str(exit_info.get('tif') or '')
+                    if tif == 'GTX' and self.flip_exit_max_wait_sec:
+                        age_ms = get_timestamp() - int(exit_info.get('timestamp') or get_timestamp())
+                        if age_ms >= int(self.flip_exit_max_wait_sec) * 1000:
+                            self.logger.warning(f"Flip close for {symbol} not filled in time; escalating to IOC")
+                            try:
+                                self.api_client.cancel_order(symbol=symbol, orderId=order_id)
+                            except Exception:
+                                pass
+                            try:
+                                if order_id in self.monitored_exits:
+                                    del self.monitored_exits[order_id]
+                            except Exception:
+                                pass
+                            new_oid = self._submit_flip_close_aggressive(symbol)
+                            if not new_oid:
+                                flip_signal = self.pending_flips.pop(symbol, None)
+                                if flip_signal is not None:
+                                    self._record_signal_status(
+                                        flip_signal,
+                                        execution_status="FAILED",
+                                        execution_error="flip_exit_escalation_failed",
+                                    )
+                except Exception:
+                    pass
+
             elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                exit_type = exit_info.get('type') or ''
                 del self.monitored_exits[order_id]
+
+                if str(exit_type) == 'FLIP_EXIT':
+                    flip_signal = self.pending_flips.pop(symbol, None)
+                    if flip_signal is not None:
+                        self._record_signal_status(
+                            flip_signal,
+                            execution_status="FAILED",
+                            execution_error=f"flip_exit_{status.lower()}"
+                        )
                 
         except Exception as e:
             self.logger.error(f"Error checking exit status {order_id}: {e}")
             # If order not found (e.g. 404), remove it
             if "Order does not exist" in str(e) or "Order was not found" in str(e):
                 if order_id in self.monitored_exits:
+                    # Clean up any pending flip signal if this was a flip exit.
+                    try:
+                        info = self.monitored_exits.get(order_id) or {}
+                        if str(info.get('type')) == 'FLIP_EXIT':
+                            flip_signal = self.pending_flips.pop(info.get('symbol'), None)
+                            if flip_signal is not None:
+                                self._record_signal_status(
+                                    flip_signal,
+                                    execution_status="FAILED",
+                                    execution_error="flip_exit_order_not_found"
+                                )
+                    except Exception:
+                        pass
                     del self.monitored_exits[order_id]
     
     def _check_stop_loss(self, symbol: str) -> None:

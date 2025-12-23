@@ -297,32 +297,127 @@ class DecisionLogger:
         """
         try:
             symbol = payload.get("symbol")
-            exec_type = payload.get("type") # FILLED, STOP_LOSS
-            side = payload.get("side") # BUY, SELL
-            
+            exec_type = payload.get("type")  # FILLED, STOP_LOSS, TAKE_PROFIT, SYNC_OPEN, SYNC_CLOSE, ...
+            side = payload.get("side")  # BUY, SELL
+            ts = int(payload.get("timestamp", get_timestamp()))
+            try:
+                qty = float(payload.get("quantity") or 0.0)
+            except Exception:
+                qty = 0.0
+            try:
+                px = float(payload.get("price") or 0.0)
+            except Exception:
+                px = 0.0
+            try:
+                commission = float(payload.get("commission") or 0.0)
+            except Exception:
+                commission = 0.0
+            commission_asset = str(payload.get("commission_asset") or "USDT")
+
             if not symbol or not exec_type or not side:
                 return
 
-            # We only care about closing trades to clear state
-            # If we have an open position in memory
+            mode = self._safe_mode()
+
+            # In LIVE mode, decisions_*.csv should reflect real executions, not simulated/implicit exits.
+            if str(mode).lower() == "live":
+                with self._lock:
+                    existing = self._open_positions.get(symbol)
+
+                    # Determine whether this execution is opening or closing relative to what we track.
+                    # This is a best-effort reconstruction; PerformanceTracker remains the source of truth.
+                    opening_dir: Optional[SignalDirection] = None
+                    if side == "BUY":
+                        opening_dir = SignalDirection.LONG
+                    elif side == "SELL":
+                        opening_dir = SignalDirection.SHORT
+
+                    is_close = False
+                    if existing and opening_dir is not None:
+                        is_long = existing.get("direction") == SignalDirection.LONG
+                        is_close = (is_long and side == "SELL") or ((not is_long) and side == "BUY")
+
+                    realized_pnl: Optional[float] = None
+                    position_size: Optional[float] = None
+                    entry_price_for_row: Optional[float] = None
+
+                    if not existing and opening_dir is not None and qty > 0 and px > 0:
+                        # Treat as opening execution
+                        self._open_positions[symbol] = {
+                            "direction": opening_dir,
+                            "entry_price": px,
+                            "timestamp": ts,
+                            "size": qty,
+                        }
+                        position_size = qty
+                        entry_price_for_row = px
+                        decision = "EXEC_ENTRY"
+                    elif existing and is_close:
+                        # Treat as closing execution
+                        try:
+                            entry_px = float(existing.get("entry_price") or 0.0)
+                            entry_qty = float(existing.get("size") or 0.0)
+                        except Exception:
+                            entry_px, entry_qty = 0.0, 0.0
+
+                        position_size = qty or entry_qty
+                        entry_price_for_row = entry_px
+
+                        # Approx realized PnL (price diff * qty) minus commission if USDT.
+                        base_pnl = 0.0
+                        if entry_px > 0 and px > 0 and position_size and position_size > 0:
+                            if existing.get("direction") == SignalDirection.LONG:
+                                base_pnl = (px - entry_px) * position_size
+                            else:
+                                base_pnl = (entry_px - px) * position_size
+
+                        # Apply leverage if configured (futures). This is approximate.
+                        try:
+                            if self.futures_mode:
+                                base_pnl *= float(self.leverage or 1.0)
+                        except Exception:
+                            pass
+
+                        realized_pnl = base_pnl
+                        if commission_asset.upper() == "USDT":
+                            realized_pnl -= commission
+
+                        # Clear tracked position
+                        self._open_positions.pop(symbol, None)
+
+                        decision = "EXEC_EXIT"
+                    else:
+                        # Not enough info to classify; do nothing.
+                        return
+
+                    # Write a CSV row for this real execution.
+                    self.csv_logger.log_decision(
+                        {
+                            "timestamp": ts,
+                            "symbol": symbol,
+                            "decision": decision,
+                            "reason": str(exec_type),
+                            "entry_price": entry_price_for_row,
+                            "realized_pnl": realized_pnl,
+                            "position_size": position_size,
+                            "mode": mode,
+                        }
+                    )
+
+                return
+
+            # Non-live mode: keep legacy behavior (only clear simulated ghost positions).
             with self._lock:
                 if symbol in self._open_positions:
                     pos = self._open_positions[symbol]
-                    # Check if this execution opposes our position (i.e. is a close)
-                    # pos['direction'] is SignalDirection.LONG or SHORT
-                    # side is "BUY" or "SELL"
-                    
                     is_long = pos['direction'] == SignalDirection.LONG
                     is_closing = (is_long and side == "SELL") or (not is_long and side == "BUY")
-                    
                     if is_closing:
-                        self.logger.info(f"Syncing DecisionLogger: Real execution {exec_type} closed {symbol}. Clearing simulated position.")
+                        self.logger.info(
+                            f"Syncing DecisionLogger: Real execution {exec_type} closed {symbol}. Clearing simulated position."
+                        )
                         del self._open_positions[symbol]
-                        
-                        # Optionally: We could also record the REAL PnL here into the decision log
-                        # but DecisionLogger is primarily for the 'decision' quality.
-                        # The PerformanceTracker handles the real PnL.
-                        
+
         except Exception as e:
             self.logger.error(f"Error handling execution payload in DecisionLogger: {e}")
 
@@ -448,6 +543,31 @@ class DecisionLogger:
 
             direction = SignalDirection[direction_raw]
             mode = self._safe_mode()
+
+            # LIVE mode: do not generate synthetic/implicit exits or simulated PnL from signals.
+            # We only log the signal itself; real closes come from trade_executions.
+            if str(mode).lower() == "live":
+                decision = DecisionLog(
+                    symbol=symbol,
+                    direction=direction,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    nobi_value=nobi_value,
+                    entry_price=entry_price,
+                    mode=mode,
+                    reason=payload.get("reason"),
+                    stop_loss=payload.get("stop_loss"),
+                    take_profit=payload.get("take_profit"),
+                    notes=payload.get("notes"),
+                )
+                decision_dict = decision.to_dict()
+                sid = payload.get('signal_id')
+                if sid:
+                    decision_dict['signal_id'] = sid
+                self._push_decision(decision_dict)
+                self._decisions_logged += 1
+                self._last_decision_ts = timestamp
+                return
 
             realized_pnl: Optional[float] = None
             pos_size: Optional[float] = None

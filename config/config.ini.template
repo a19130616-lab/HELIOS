@@ -15,6 +15,18 @@ rescan_interval_sec = 300
 # Cooldown in minutes between trades for the same symbol (0 to disable)
 trading_cooldown_minutes = 15
 
+# When true: if an opposite signal arrives while a position is open, close the position first
+# (reduce-only IOC limit) and then open the new direction after the close fills.
+# When false: opposite signals are skipped while a position is open.
+flip_on_opposite_signal = false
+
+# Flip close behavior (fees): try post-only maker close first, then escalate to IOC if not filled quickly.
+flip_exit_post_only = true
+flip_exit_max_wait_sec = 4
+flip_exit_maker_offset_pct = 0.0001
+# Minimum seconds between flips per symbol (reduces chop churn)
+flip_min_interval_sec = 20
+
 [signals]
 nobi_depth = 10
 nobi_trigger_threshold = 0.4
@@ -29,6 +41,17 @@ trailing_stop_atr_multiple = 1.5
 leverage = 10
 warning_margin_ratio = 30
 critical_margin_ratio = 15
+
+# Stop-loss tuning (reduce whipsaw so TP dominates more often)
+# Initial stop bounds (percent of entry)
+stop_loss_min_pct = 0.01
+stop_loss_max_pct = 0.05
+# Only start trailing once position has >= this profit
+trailing_stop_activation_profit_pct = 0.005
+# Require stop breach beyond stop by this buffer to trigger (avoid wick touches)
+stop_loss_trigger_buffer_pct = 0.0005
+# Require stop breach to persist for N seconds (avoid 1-second noise)
+stop_loss_trigger_confirm_sec = 2
 
 [system]
 redis_host = localhost
