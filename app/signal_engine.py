@@ -90,6 +90,13 @@ class SignalEngine:
             self.min_signal_interval_ms = int(self.config.get('signals', 'min_signal_interval_ms', fallback=30000))
         except Exception:
             self.min_signal_interval_ms = 30000
+
+        # Reject logging throttle (prevents REJECT spam in dashboard when filters block trading)
+        try:
+            self.reject_log_interval_ms = int(self.config.get('signals', 'reject_log_interval_ms', fallback=30000))
+        except Exception:
+            self.reject_log_interval_ms = 30000
+        self.last_reject_log_time = {symbol: 0 for symbol in symbols}
         try:
             self.confirm_window_sec = int(self.config.get('signals', 'confirm_window_sec', fallback=120))
         except Exception:
@@ -340,8 +347,9 @@ class SignalEngine:
                         "decision": "REJECT",
                         "reason": f"Awaiting Confirmation ({same_dir_count}/{required})"
                     }
-                    self.decision_logger.log_decision(log_payload)
-                    self._log_decision_to_redis(log_payload)
+                    if self._should_log_reject(symbol):
+                        self.decision_logger.log_decision(log_payload)
+                        self._log_decision_to_redis(log_payload)
                     return
             except Exception:
                 # If confirmation gate fails for any reason, do not block trading.
@@ -362,8 +370,9 @@ class SignalEngine:
                     "decision": "REJECT",
                     "reason": "Ranging Regime"
                 }
-                self.decision_logger.log_decision(log_payload)
-                self._log_decision_to_redis(log_payload)
+                if self._should_log_reject(symbol):
+                    self.decision_logger.log_decision(log_payload)
+                    self._log_decision_to_redis(log_payload)
                 return
             
             # --- Volume-Price Strategy Optimization ---
@@ -383,8 +392,7 @@ class SignalEngine:
                 # Filter: Require trade size to be at least N x average (Significant interest)
                 # If multiplier <= 1.0, treat as disabled.
                 if self.volume_spike_multiplier > 1.0 and avg_vol > 0 and current_vol < (avg_vol * self.volume_spike_multiplier):
-                    # Log rejection
-                    self.decision_logger.log_decision({
+                    log_payload = {
                         "timestamp": get_timestamp(),
                         "symbol": symbol,
                         "price": order_book_data.get('mid_price', 0),
@@ -395,7 +403,10 @@ class SignalEngine:
                         "ml_confidence": 0,
                         "decision": "REJECT",
                         "reason": "Low Volume"
-                    })
+                    }
+                    if self._should_log_reject(symbol):
+                        self.decision_logger.log_decision(log_payload)
+                        self._log_decision_to_redis(log_payload)
                     return
 
             # 2. VWAP Confirmation (Fair Price)
@@ -425,8 +436,9 @@ class SignalEngine:
                         "decision": "REJECT",
                         "reason": "Price > VWAP (Overextended)"
                     }
-                    self.decision_logger.log_decision(log_payload)
-                    self._log_decision_to_redis(log_payload)
+                    if self._should_log_reject(symbol):
+                        self.decision_logger.log_decision(log_payload)
+                        self._log_decision_to_redis(log_payload)
                     return
                 if direction == SignalDirection.SHORT and current_price < vwap * 0.995: # 0.5% buffer
                     log_payload = {
@@ -441,8 +453,9 @@ class SignalEngine:
                         "decision": "REJECT",
                         "reason": "Price < VWAP (Oversold)"
                     }
-                    self.decision_logger.log_decision(log_payload)
-                    self._log_decision_to_redis(log_payload)
+                    if self._should_log_reject(symbol):
+                        self.decision_logger.log_decision(log_payload)
+                        self._log_decision_to_redis(log_payload)
                     return
             # ------------------------------------------
             
@@ -473,6 +486,17 @@ class SignalEngine:
                     "decision": f"SIGNAL_{direction.value}",
                     "reason": "ML Confidence Met"
                 })
+
+                # Also publish to Redis so the dashboard reflects actual emitted signals.
+                self._log_decision_to_redis({
+                    "timestamp": get_timestamp(),
+                    "symbol": symbol,
+                    "price": order_book_data.get('mid_price', 0),
+                    "nobi_value": nobi_value,
+                    "confidence": float(confidence),
+                    "direction": direction.value,
+                    "reason": "ML Confidence Met",
+                })
                 
                 self.logger.info(f"Generated {direction.value} signal for {symbol} - "
                                f"NOBI: {nobi_value:.4f}, Confidence: {confidence:.3f}")
@@ -489,8 +513,9 @@ class SignalEngine:
                     "decision": "REJECT",
                     "reason": f"Low ML Confidence ({confidence:.3f})"
                 }
-                self.decision_logger.log_decision(log_payload)
-                self._log_decision_to_redis(log_payload)
+                if self._should_log_reject(symbol):
+                    self.decision_logger.log_decision(log_payload)
+                    self._log_decision_to_redis(log_payload)
                 self.signals_generated += 1
                 
                 self.logger.info(f"Generated {direction.value} signal for {symbol} - "
@@ -508,8 +533,31 @@ class SignalEngine:
             
             # Ensure direction is present (dashboard requirement)
             if 'direction' not in decision_data:
-                # Map 'decision' (e.g. REJECT) to 'direction'
-                decision_data['direction'] = decision_data.get('decision', 'UNKNOWN')
+                # Map 'decision' (e.g. REJECT or SIGNAL_LONG) to 'direction'
+                decision_raw = str(decision_data.get('decision', 'UNKNOWN') or 'UNKNOWN')
+                if decision_raw.startswith('SIGNAL_'):
+                    decision_data['direction'] = decision_raw.replace('SIGNAL_', '', 1)
+                else:
+                    decision_data['direction'] = decision_raw
+
+            # Dashboard expects numeric confidence; default to 0 when absent.
+            if 'confidence' not in decision_data:
+                ml_conf = decision_data.get('ml_confidence', 0.0)
+                try:
+                    decision_data['confidence'] = float(ml_conf)
+                except Exception:
+                    decision_data['confidence'] = 0.0
+
+            # Dashboard expects nobi_value
+            if 'nobi_value' not in decision_data and 'nobi' in decision_data:
+                try:
+                    decision_data['nobi_value'] = float(decision_data.get('nobi') or 0.0)
+                except Exception:
+                    decision_data['nobi_value'] = 0.0
+
+            # Avoid rendering "undefined" in the UI.
+            if 'mode' not in decision_data:
+                decision_data['mode'] = ''
             
             # Push to Redis list
             self.redis_manager.redis_client.lpush('decision_logs', json.dumps(decision_data))
@@ -517,6 +565,22 @@ class SignalEngine:
             self.redis_manager.redis_client.ltrim('decision_logs', 0, 499)
         except Exception as e:
             self.logger.error(f"Error logging decision to Redis: {e}")
+
+    def _should_log_reject(self, symbol: str) -> bool:
+        """Rate-limit REJECT logs to prevent dashboard spam in blocked market conditions."""
+        try:
+            now_ts = get_timestamp()
+            last_ts = int(self.last_reject_log_time.get(symbol, 0))
+            interval = int(max(0, int(getattr(self, 'reject_log_interval_ms', 30000))))
+            if interval <= 0:
+                self.last_reject_log_time[symbol] = now_ts
+                return True
+            if (now_ts - last_ts) < interval:
+                return False
+            self.last_reject_log_time[symbol] = now_ts
+            return True
+        except Exception:
+            return True
 
     def _is_too_soon_for_signal(self, symbol: str, min_interval_ms: Optional[int] = None) -> bool:
         """

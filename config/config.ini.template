@@ -44,6 +44,10 @@ confirm_max_events = 6
 # Minimum time between emitted signals per symbol (ms)
 min_signal_interval_ms = 120000
 
+# Rate-limit REJECT rows in the dashboard/CSV (ms). Helps avoid spam when regime gate blocks trading.
+# Set to 0 to disable throttling.
+reject_log_interval_ms = 30000
+
 # Best-ROI regime gate: avoid trading when the market is detected as ranging/choppy.
 # Helps reduce flip churn and stop-loss whipsaws. Default off.
 avoid_ranging_regime = false

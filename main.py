@@ -344,8 +344,16 @@ class HeliosSystem:
             self.signal_engine = SignalEngine(self.redis_manager, self.watchlist)
             
             # Reddit Ingestor
-            self.logger.info("Initializing Reddit Ingestor...")
-            self.reddit_ingestor = RedditIngestor(self.redis_manager)
+            try:
+                reddit_enabled = bool(self.config.get('reddit', 'enabled', bool, fallback=False))
+            except Exception:
+                reddit_enabled = False
+            if reddit_enabled:
+                self.logger.info("Initializing Reddit Ingestor...")
+                self.reddit_ingestor = RedditIngestor(self.redis_manager)
+            else:
+                self.logger.info("Reddit Ingestor disabled by config")
+                self.reddit_ingestor = None
             
             # Performance Tracker
             self.logger.info("Initializing Performance Tracker...")
