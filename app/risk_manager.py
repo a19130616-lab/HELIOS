@@ -36,6 +36,21 @@ class RiskManager:
         
         # Configuration parameters
         self.kelly_fraction = self.config.get('risk', 'kelly_fraction', float)
+        # Fixed trade amount support
+        try:
+            self.fixed_trade_amount_usdt = float(self.config.get('risk', 'fixed_trade_amount_usdt', float, fallback=0.0))
+        except Exception:
+            self.fixed_trade_amount_usdt = 0.0
+
+        # Percent-based sizing: margin% of available balance, then apply leverage to get notional.
+        # Notional per trade = available_balance * margin_pct_per_trade * leverage
+        try:
+            self.margin_pct_per_trade = float(
+                self.config.get('risk', 'margin_pct_per_trade', float, fallback=0.0)
+            )
+        except Exception:
+            self.margin_pct_per_trade = 0.0
+
         self.leverage = self.config.get('risk', 'leverage', int)
         self.trailing_stop_atr_multiple = self.config.get('risk', 'trailing_stop_atr_multiple', float)
         self.warning_margin_ratio = self.config.get('risk', 'warning_margin_ratio', float)
@@ -91,6 +106,14 @@ class RiskManager:
             )
         except Exception:
             self.stop_loss_trigger_confirm_sec = 2
+
+        # Fixed trailing stop distance (overrides ATR if > 0)
+        try:
+            self.trailing_stop_distance_pct = float(
+                self.config.get('risk', 'trailing_stop_distance_pct', float, fallback=0.0)
+            )
+        except Exception:
+            self.trailing_stop_distance_pct = 0.0
 
         # symbol -> first timestamp (ms) when stop was breached (buffer-adjusted)
         self._stop_breach_start_ms: Dict[str, int] = {}
@@ -236,7 +259,7 @@ class RiskManager:
     
     def get_position_size(self, symbol: str, entry_price: float, stop_loss: float) -> float:
         """
-        Calculate position size using fixed 1% margin allocation.
+        Calculate position size using Fixed Amount (Scalper Mode) or Kelly Criterion.
         
         Args:
             symbol: Trading symbol
@@ -260,29 +283,72 @@ class RiskManager:
             
             available_balance = account_info.available_balance
             
-            # Fixed 1% margin allocation
-            margin_pct = 0.01
-            margin_amount = available_balance * margin_pct
-            
-            # Calculate total position value (Notional)
-            # Notional = Margin * Leverage
-            position_value = margin_amount * self.leverage
-            
-            # Calculate quantity
-            position_size = position_value / entry_price
-            
-            # Safety check - ensure we don't exceed account limits (use max 95% of available for safety)
-            max_position_value = available_balance * self.leverage * 0.95
-            if position_size * entry_price > max_position_value:
-                self.logger.warning(f"Position size {position_size} exceeds max safe limit, capping.")
+            # 1) Fixed Amount Mode (highest priority)
+            if self.fixed_trade_amount_usdt > 0:
+                trade_value = float(self.fixed_trade_amount_usdt)
+                max_trade_value = float(available_balance) * float(self.leverage) * 0.95  # 5% buffer
+                if trade_value > max_trade_value:
+                    self.logger.warning(
+                        f"Fixed amount {trade_value:.2f} exceeds max capacity {max_trade_value:.2f}. Capping."
+                    )
+                    trade_value = max_trade_value
+
+                if entry_price <= 0:
+                    return 0.0
+
+                position_size = trade_value / entry_price
+                self.logger.info(
+                    f"Position sizing for {symbol}: Balance={available_balance:.2f}, "
+                    f"Mode=FIXED_USDT, Notional={trade_value:.2f}, Leverage={self.leverage}, "
+                    f"Size={position_size:.6f}"
+                )
+                return position_size
+
+            # 2) Percent-of-balance Margin Mode (recommended for small accounts)
+            if self.margin_pct_per_trade and self.margin_pct_per_trade > 0:
+                margin_amount = float(available_balance) * float(self.margin_pct_per_trade)
+                trade_value = margin_amount * float(self.leverage)
+
+                # Safety cap: don't exceed max notional capacity with a small buffer
+                max_trade_value = float(available_balance) * float(self.leverage) * 0.95
+                if trade_value > max_trade_value:
+                    trade_value = max_trade_value
+
+                if entry_price <= 0:
+                    return 0.0
+
+                position_size = trade_value / entry_price
+                self.logger.info(
+                    f"Position sizing for {symbol}: Balance={available_balance:.2f}, "
+                    f"Margin={margin_amount:.2f} ({self.margin_pct_per_trade:.2%}), Leverage={self.leverage}, "
+                    f"Notional={trade_value:.2f}, Size={position_size:.6f}"
+                )
+                return position_size
+
+            # 3) Kelly Criterion Mode (fallback)
+            kelly_f = kelly_criterion(self.win_rate, self.avg_win, self.avg_loss)
+            kelly_f *= self.kelly_fraction
+            kelly_f = min(kelly_f, 0.05)  # Max 5% risk per trade
+            if kelly_f <= 0:
+                return 0.0
+
+            risk_per_unit = abs(entry_price - stop_loss)
+            if risk_per_unit <= 0:
+                return 0.0
+
+            risk_amount = float(available_balance) * float(kelly_f)
+            position_size = risk_amount / risk_per_unit
+
+            max_position_value = float(available_balance) * float(self.leverage) * 0.95
+            if position_size * entry_price > max_position_value and entry_price > 0:
                 position_size = max_position_value / entry_price
-            
-            self.logger.info(f"Position sizing for {symbol}: Balance={available_balance:.2f}, "
-                           f"Margin={margin_amount:.2f} (1%), Leverage={self.leverage}, "
-                           f"Size={position_size:.6f}")
-            
+
+            self.logger.info(
+                f"Position sizing for {symbol}: Balance={available_balance:.2f}, "
+                f"Mode=KELLY, RiskAmt={risk_amount:.2f}, Leverage={self.leverage}, Size={position_size:.6f}"
+            )
             return position_size
-            
+
         except Exception as e:
             self.logger.error(f"Error calculating position size: {e}")
             return 0.0
@@ -581,24 +647,31 @@ class RiskManager:
             if position.high_water_mark is None:
                 return
             
-            # Get ATR-based distance
-            try:
-                if self.api_client is None:
-                    # No API client (public/synthetic) - use fixed 1% distance
-                    atr_distance = position.high_water_mark * 0.01
-                else:
-                    klines = self.api_client.klines(symbol=position.symbol, interval="1m", limit=20)
-                    if len(klines) >= 14:
-                        highs = [float(kline[2]) for kline in klines]
-                        lows = [float(kline[3]) for kline in klines]
-                        closes = [float(kline[4]) for kline in klines]
-                        
-                        atr = calculate_atr(highs, lows, closes)
-                        atr_distance = atr * self.trailing_stop_atr_multiple
+            # Determine trailing distance
+            atr_distance = 0.0
+            
+            # 1. Fixed Percentage Distance (Scalper Preference)
+            if self.trailing_stop_distance_pct > 0:
+                atr_distance = position.high_water_mark * self.trailing_stop_distance_pct
+            else:
+                # 2. ATR-based distance (Legacy/Swing)
+                try:
+                    if self.api_client is None:
+                        # No API client (public/synthetic) - use fixed 1% distance
+                        atr_distance = position.high_water_mark * 0.01
                     else:
-                        atr_distance = position.high_water_mark * 0.01  # 1% fallback
-            except:
-                atr_distance = position.high_water_mark * 0.01
+                        klines = self.api_client.klines(symbol=position.symbol, interval="1m", limit=20)
+                        if len(klines) >= 14:
+                            highs = [float(kline[2]) for kline in klines]
+                            lows = [float(kline[3]) for kline in klines]
+                            closes = [float(kline[4]) for kline in klines]
+                            
+                            atr = calculate_atr(highs, lows, closes)
+                            atr_distance = atr * self.trailing_stop_atr_multiple
+                        else:
+                            atr_distance = position.high_water_mark * 0.01  # 1% fallback
+                except:
+                    atr_distance = position.high_water_mark * 0.01
             
             # Calculate new stop loss
             if position.side == OrderSide.BUY:

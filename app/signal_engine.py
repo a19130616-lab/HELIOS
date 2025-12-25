@@ -48,6 +48,30 @@ class SignalEngine:
         self.ml_confidence_threshold = self.config.get('signals', 'ml_confidence_threshold', float)
         self.ml_model_path = self.config.get('signals', 'ml_model_path')
 
+        # Hybrid Strategy Configuration
+        try:
+            self.primary_timeframe = self.config.get('signals', 'primary_timeframe', fallback='1m')
+            self.trend_timeframe = self.config.get('signals', 'trend_timeframe', fallback='1h')
+            self.cooldown_minutes = int(self.config.get('signals', 'cooldown_minutes', fallback=30))
+            self.take_profit_pct = float(self.config.get('signals', 'take_profit_pct', fallback=1.0))
+            self.stop_loss_pct = float(self.config.get('signals', 'stop_loss_pct', fallback=0.5))
+            self.trailing_stop_activation = float(self.config.get('signals', 'trailing_stop_activation', fallback=0.6))
+        except Exception:
+            self.primary_timeframe = '1m'
+            self.trend_timeframe = '1h'
+            self.cooldown_minutes = 30
+            self.take_profit_pct = 1.0
+            self.stop_loss_pct = 0.5
+            self.trailing_stop_activation = 0.6
+
+        # Minimum Profitability Filter settings
+        try:
+            self.min_net_profit_pct = float(self.config.get('signals', 'min_net_profit_pct', float, fallback=0.0015))
+            self.taker_fee_pct = float(self.config.get('signals', 'taker_fee_pct', float, fallback=0.0005))
+        except Exception:
+            self.min_net_profit_pct = 0.0015
+            self.taker_fee_pct = 0.0005
+
         # Volume-spike filter (whale confirmation)
         # If <= 1.0, the filter is effectively disabled.
         try:
@@ -118,7 +142,7 @@ class SignalEngine:
         self.signal_queue = Queue()
         
         # Data buffers for feature engineering
-        self.price_buffers = {symbol: CircularBuffer(100) for symbol in symbols}
+        self.price_buffers = {symbol: CircularBuffer(2000) for symbol in symbols}
         self.nobi_buffers = {symbol: CircularBuffer(50) for symbol in symbols}
         self.volume_buffers = {symbol: CircularBuffer(100) for symbol in symbols}
         self.last_trade_ids = {} # Track last processed trade to avoid duplicates
@@ -202,11 +226,11 @@ class SignalEngine:
     
     def _process_symbol_signals(self, symbol: str) -> None:
         """
-        Process signals for a specific symbol.
-        
-        Args:
-            symbol: Trading symbol
+        Process signals for a specific symbol using Hybrid Strategy.
         """
+        # 1. Check Trade Duration (Exit Logic)
+        self.check_trade_duration(symbol)
+
         if symbol not in self.price_buffers:
             self.logger.error(f"DEBUG: Symbol {symbol} not in price_buffers! Skipping.")
             return
@@ -216,6 +240,10 @@ class SignalEngine:
         if not order_book_data:
             return
         
+        current_price = order_book_data.get('mid_price', 0)
+        if current_price == 0:
+            return
+
         # Calculate NOBI
         nobi_value = self._calculate_nobi_from_data(order_book_data)
         if nobi_value is None:
@@ -224,9 +252,152 @@ class SignalEngine:
         # Update data buffers
         self._update_buffers(symbol, order_book_data, nobi_value)
         
-        # Check for NOBI trigger
-        if abs(nobi_value) >= self.nobi_threshold:
-            self._handle_nobi_trigger(symbol, nobi_value, order_book_data)
+        # --- Hybrid Strategy Logic ---
+        
+        # Step A: Trend Direction (1H EMA 50)
+        ema_50_1h = self._get_1h_ema(symbol)
+        
+        # If we don't have 1H data yet, we can't determine trend. 
+        # For safety, we skip or fallback. Here we skip.
+        if ema_50_1h is None:
+            return 
+
+        bias = None
+        if current_price > ema_50_1h:
+            bias = SignalDirection.LONG
+        elif current_price < ema_50_1h:
+            bias = SignalDirection.SHORT
+        
+        if not bias:
+            return
+
+        # Step B: Micro-Trigger (1m NOBI)
+        # User Spec: LONG if NOBI > 0.65, SHORT if NOBI < -0.65
+        
+        signal_direction = None
+        
+        if bias == SignalDirection.LONG:
+            if nobi_value > 0.65:
+                signal_direction = SignalDirection.LONG
+        elif bias == SignalDirection.SHORT:
+            if nobi_value < -0.65:
+                signal_direction = SignalDirection.SHORT
+        
+        if not signal_direction:
+            return
+
+        # Cooldown Check
+        last_sig_time = self.last_signal_time.get(symbol, 0)
+        if (get_timestamp() - last_sig_time) < (self.cooldown_minutes * 60 * 1000):
+            return
+
+        # Generate Signal
+        self._generate_signal(symbol, signal_direction, current_price, nobi_value, "Hybrid Strategy Trigger")
+
+    def _get_1h_ema(self, symbol: str) -> Optional[float]:
+        """Get 50-period EMA from 1H klines."""
+        try:
+            # Fetch 1h klines from Redis
+            key = f"klines:{symbol}:1h"
+            # Need at least 50 + buffer
+            kline_data_raw = self.redis_manager.redis_client.lrange(key, 0, 99)
+            if not kline_data_raw or len(kline_data_raw) < 50:
+                return None
+            
+            # Parse klines (stored as JSON strings)
+            # Redis lrange returns in order (latest first usually if lpush used)
+            klines = [json.loads(k) for k in kline_data_raw]
+            klines.reverse() # Now chronological
+            
+            closes = [k['close'] for k in klines]
+            
+            ema_value = calculate_ema(closes, 50)
+            return ema_value
+        except Exception as e:
+            self.logger.error(f"Error calculating 1H EMA for {symbol}: {e}")
+            return None
+
+    def check_trade_duration(self, symbol: str) -> None:
+        """
+        Check if open trades have exceeded duration limit.
+        """
+        try:
+            # Get open positions from Redis (set by DecisionLogger/RiskManager)
+            open_positions_raw = self.redis_manager.get_data("open_positions")
+            if not open_positions_raw:
+                return
+            
+            position_data = open_positions_raw.get(symbol)
+            if not position_data:
+                return
+            
+            entry_ts = position_data.get('timestamp')
+            entry_price = position_data.get('entry_price')
+            direction_str = position_data.get('direction')
+            
+            if not entry_ts or not entry_price or not direction_str:
+                return
+                
+            # Check duration (60 minutes)
+            duration_ms = get_timestamp() - entry_ts
+            if duration_ms < (60 * 60 * 1000):
+                return
+                
+            # Check PnL
+            order_book = self._get_latest_order_book(symbol)
+            if not order_book:
+                return
+            current_price = order_book.get('mid_price', 0)
+            
+            pnl_pct = 0.0
+            if direction_str == "LONG" or direction_str == SignalDirection.LONG.name:
+                pnl_pct = (current_price - entry_price) / entry_price
+                exit_dir = SignalDirection.EXIT_LONG
+            else:
+                pnl_pct = (entry_price - current_price) / entry_price
+                exit_dir = SignalDirection.EXIT_SHORT
+                
+            if pnl_pct > 0:
+                self.logger.info(f"Time-based Exit for {symbol}: Duration {duration_ms/60000:.1f}m > 60m and PnL {pnl_pct*100:.2f}% > 0")
+                self._generate_signal(symbol, exit_dir, current_price, 0.0, "Time-based Exit (60m)")
+                
+        except Exception as e:
+            self.logger.error(f"Error checking trade duration for {symbol}: {e}")
+
+    def _generate_signal(self, symbol: str, direction: SignalDirection, price: float, nobi: float, reason: str) -> None:
+        """Generate and queue a trading signal."""
+        ts = get_timestamp()
+
+        # Hybrid strategy bypasses ML; derive a conservative confidence signal from NOBI magnitude.
+        # For explicit EXIT_* signals, treat as high confidence.
+        try:
+            if direction in (SignalDirection.EXIT_LONG, SignalDirection.EXIT_SHORT):
+                confidence = 1.0
+            else:
+                denom = max(float(self.nobi_threshold or 0.0), 1e-9)
+                confidence = min(1.0, abs(float(nobi)) / denom)
+        except Exception:
+            confidence = 1.0
+
+        signal = TradingSignal(
+            symbol=symbol,
+            direction=direction,
+            timestamp=ts,
+            confidence=float(confidence),
+            nobi_value=float(nobi),
+            entry_price=float(price),
+            reason=reason,
+            metadata={
+                "strategy": "Hybrid",
+            },
+        )
+
+        # Publish to Redis (ExecutionManager + DecisionLogger consume from this channel)
+        self._publish_signal(signal)
+
+        self.last_signal_time[symbol] = ts
+        self.signals_generated += 1
+        self.logger.info(f"SIGNAL GENERATED: {symbol} {direction.value} @ {price} | {reason}")
     
     def _process_symbol_signals_10m(self, symbol: str) -> None:
         """
@@ -356,7 +527,13 @@ class SignalEngine:
                 pass
 
             # 0. Regime Gate: optionally avoid signals during RANGING conditions.
+            # REFACTORED: Instead of avoiding ranging, we now check for minimum volatility (ATR proxy)
+            # to ensure price movement is sufficient to cover fees.
+            # We use market_regime_ema_diff_threshold as the volatility gate.
             regime = self.market_regimes.get(symbol, MarketRegime.UNKNOWN)
+            
+            # If avoid_ranging_regime is TRUE, we block RANGING.
+            # If FALSE (Scalper Mode), we ignore regime but check volatility if possible.
             if self.avoid_ranging_regime and regime == MarketRegime.RANGING:
                 log_payload = {
                     "timestamp": get_timestamp(),
@@ -375,6 +552,39 @@ class SignalEngine:
                     self._log_decision_to_redis(log_payload)
                 return
             
+            # Minimum Profitability Filter (MVM Check)
+            # Formula: MVM = (Fees * 2) + Minimum_Net_Profit
+            mvm_pct = (self.taker_fee_pct * 2) + self.min_net_profit_pct
+            
+            # Calculate current volatility potential from recent price history
+            # We use the price buffer (max 2000 ticks) to estimate immediate volatility range.
+            prices = self.price_buffers[symbol].get_values()
+            current_price = order_book_data.get('mid_price', 0)
+            
+            if len(prices) > 50 and current_price > 0:
+                # Use range (High - Low) / Current as volatility proxy
+                high_p = max(prices)
+                low_p = min(prices)
+                volatility_pct = (high_p - low_p) / current_price
+                
+                if volatility_pct < mvm_pct:
+                    log_payload = {
+                        "timestamp": get_timestamp(),
+                        "symbol": symbol,
+                        "price": current_price,
+                        "nobi": nobi_value,
+                        "rsi": 0,
+                        "volume_ratio": "0.00",
+                        "vwap_gap_pct": 0,
+                        "ml_confidence": 0,
+                        "decision": "REJECT",
+                        "reason": f"Low Volatility ({volatility_pct:.4f} < {mvm_pct:.4f})"
+                    }
+                    if self._should_log_reject(symbol):
+                        self.decision_logger.log_decision(log_payload)
+                        self._log_decision_to_redis(log_payload)
+                    return
+
             # --- Volume-Price Strategy Optimization ---
             # 1. Volume Spike Confirmation (Whale Tracking)
             # We only trade if the current trade size is significantly larger than the recent average.
@@ -810,6 +1020,22 @@ class SignalEngine:
             'entry_price': signal.entry_price,
             'signal_id': signal.signal_id,
         }
+
+        # Optional enrichment fields (safe for consumers that ignore unknown keys)
+        try:
+            if getattr(signal, 'stop_loss', None) is not None:
+                signal_data['stop_loss'] = signal.stop_loss
+            if getattr(signal, 'take_profit', None) is not None:
+                signal_data['take_profit'] = signal.take_profit
+            if getattr(signal, 'reason', None):
+                signal_data['reason'] = signal.reason
+            if getattr(signal, 'notes', None):
+                signal_data['notes'] = signal.notes
+            md = getattr(signal, 'metadata', None)
+            if isinstance(md, dict) and md:
+                signal_data['metadata'] = md
+        except Exception:
+            pass
         
         # Add to local queue
         self.signal_queue.put(signal)

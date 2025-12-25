@@ -4,7 +4,7 @@ Data models and structures for the Helios Trading System.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import time
 
 class OrderSide(Enum):
@@ -73,6 +73,10 @@ class TradingSignal:
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     signal_id: Optional[str] = None
+    # Optional enrichment fields (ignored by execution if unused)
+    reason: Optional[str] = None
+    notes: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
     
     def __post_init__(self):
         """Validate signal data after initialization."""

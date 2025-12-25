@@ -92,85 +92,83 @@ class PublicPriceIngestor:
     def _fetch_historical_data(self) -> None:
         """
         Fetch historical klines on startup to populate price history.
-
-        Enhanced logging added to aid diagnosis of empty Redis klines:* lists:
-          - Per-symbol timing, counts, first/last kline timestamps
-          - Redis list length verification after population
-          - Aggregate summary at end
+        Fetches both 1m (for triggers) and 1h (for trend filter) klines.
         """
         started_at = time.time()
         total_loaded = 0
+        
+        intervals = ['1m', '1h']
+        
         for symbol in self.symbols:
-            sym_start = time.time()
-            try:
-                self.logger.info(f"[HIST] Fetching last 200 1m klines for {symbol} (futures primary, spot fallback)...")
-
-                klines_json = self._fetch_with_fallback(
-                    primary=lambda: self._get_json(
-                        f"{self.base_primary}/fapi/v1/klines",
-                        params={"symbol": symbol, "interval": "1m", "limit": 200},
-                    ),
-                    fallback=lambda: self._get_json(
-                        f"{self.base_fallback}/api/v3/klines",
-                        params={"symbol": symbol, "interval": "1m", "limit": 200},
-                    ),
-                    context=f"historical_klines:{symbol}",
-                )
-
-                if not klines_json or not isinstance(klines_json, list):
-                    self.logger.warning(f"[HIST] No historical data returned for {symbol} (type={type(klines_json).__name__})")
-                    continue
-
-                count = len(klines_json)
-                self.kline_data[symbol] = []
-                first_ts = None
-                last_ts = None
-
-                for idx, kline_arr in enumerate(klines_json):
-                    try:
-                        ts_val = int(kline_arr[6]) if len(kline_arr) > 6 else int(kline_arr[0])
-                        kline = {
-                            "symbol": symbol,
-                            "timestamp": ts_val,
-                            "open": float(kline_arr[1]),
-                            "high": float(kline_arr[2]),
-                            "low": float(kline_arr[3]),
-                            "close": float(kline_arr[4]),
-                            "volume": float(kline_arr[5]),
-                            "trades": int(kline_arr[8]) if len(kline_arr) > 8 else 0,
-                        }
-                        if first_ts is None or ts_val < first_ts:
-                            first_ts = ts_val
-                        if last_ts is None or ts_val > last_ts:
-                            last_ts = ts_val
-                        self.kline_data[symbol].append(kline)
-                        self._store_kline(kline)
-
-                        # Lightweight progress log every 50 inserts
-                        if (idx + 1) % 50 == 0:
-                            self.logger.debug(f"[HIST] {symbol} inserted {idx + 1}/{count} klines...")
-                    except Exception as inner_e:
-                        self.logger.warning(f"[HIST] Parse/store error {symbol} idx={idx}: {inner_e}")
-
-                # Verify Redis list population
-                list_key = f"klines:{symbol}"
+            for interval in intervals:
+                sym_start = time.time()
                 try:
-                    redis_len = self.redis_manager.redis_client.llen(list_key)
-                except Exception as rl_err:
-                    redis_len = -1
-                    self.logger.error(f"[HIST] Could not read Redis length for {list_key}: {rl_err}")
+                    limit = 200 if interval == '1m' else 100 # Need 50 for EMA, 100 is safe
+                    self.logger.info(f"[HIST] Fetching last {limit} {interval} klines for {symbol}...")
 
-                span_min = ((last_ts - first_ts) / 60000.0) if (first_ts and last_ts) else 0
-                self.logger.info(
-                    f"[HIST] Loaded {len(self.kline_data[symbol])}/{count} klines for {symbol} "
-                    f"(redis_len={redis_len}, span_min≈{span_min:.1f}, first_ts={first_ts}, last_ts={last_ts}, "
-                    f"elapsed={time.time() - sym_start:.2f}s)"
-                )
-                self.last_kline_fetch[symbol] = time.time()
-                total_loaded += len(self.kline_data[symbol])
+                    klines_json = self._fetch_with_fallback(
+                        primary=lambda: self._get_json(
+                            f"{self.base_primary}/fapi/v1/klines",
+                            params={"symbol": symbol, "interval": interval, "limit": limit},
+                        ),
+                        fallback=lambda: self._get_json(
+                            f"{self.base_fallback}/api/v3/klines",
+                            params={"symbol": symbol, "interval": interval, "limit": limit},
+                        ),
+                        context=f"historical_klines:{symbol}:{interval}",
+                    )
 
-            except Exception as e:
-                self.logger.error(f"[HIST] Error fetching historical data for {symbol}: {e}")
+                    if not klines_json or not isinstance(klines_json, list):
+                        self.logger.warning(f"[HIST] No historical data returned for {symbol} {interval}")
+                        continue
+
+                    count = len(klines_json)
+                    
+                    # Initialize storage if needed
+                    if symbol not in self.kline_data:
+                        self.kline_data[symbol] = {}
+                    if isinstance(self.kline_data[symbol], list):
+                        self.kline_data[symbol] = {'1m': self.kline_data[symbol]}
+                    if interval not in self.kline_data[symbol]:
+                        self.kline_data[symbol][interval] = []
+
+                    first_ts = None
+                    last_ts = None
+
+                    for idx, kline_arr in enumerate(klines_json):
+                        try:
+                            ts_val = int(kline_arr[6]) if len(kline_arr) > 6 else int(kline_arr[0])
+                            kline = {
+                                "symbol": symbol,
+                                "interval": interval,
+                                "timestamp": ts_val,
+                                "open": float(kline_arr[1]),
+                                "high": float(kline_arr[2]),
+                                "low": float(kline_arr[3]),
+                                "close": float(kline_arr[4]),
+                                "volume": float(kline_arr[5]),
+                                "trades": int(kline_arr[8]) if len(kline_arr) > 8 else 0,
+                            }
+                            if first_ts is None or ts_val < first_ts:
+                                first_ts = ts_val
+                            if last_ts is None or ts_val > last_ts:
+                                last_ts = ts_val
+                            
+                            self.kline_data[symbol][interval].append(kline)
+                            self._store_kline(kline)
+
+                        except Exception as inner_e:
+                            self.logger.warning(f"[HIST] Parse/store error {symbol} {interval} idx={idx}: {inner_e}")
+
+                    self.logger.info(
+                        f"[HIST] Loaded {len(self.kline_data[symbol][interval])}/{count} {interval} klines for {symbol} "
+                        f"(elapsed={time.time() - sym_start:.2f}s)"
+                    )
+                    self.last_kline_fetch[symbol] = time.time()
+                    total_loaded += len(self.kline_data[symbol][interval])
+
+                except Exception as e:
+                    self.logger.error(f"[HIST] Error fetching historical data for {symbol} {interval}: {e}")
 
         self.logger.info(
             f"[HIST] Historical backfill complete symbols={len(self.symbols)} total_klines={total_loaded} "
@@ -230,6 +228,7 @@ class PublicPriceIngestor:
         # Kline: every kline_interval_sec
         last_k = self.last_kline_fetch.get(symbol, 0)
         if now - last_k >= self.kline_interval_sec - 0.5:
+            # Poll 1m kline
             kline_json = self._fetch_with_fallback(
                 primary=lambda: self._get_json(
                     f"{self.base_primary}/fapi/v1/klines",
@@ -239,11 +238,28 @@ class PublicPriceIngestor:
                     f"{self.base_fallback}/api/v3/klines",
                     params={"symbol": symbol, "interval": "1m", "limit": 1},
                 ),
-                context=f"kline:{symbol}",
+                context=f"kline:{symbol}:1m",
             )
             if kline_json and isinstance(kline_json, list) and kline_json:
-                self._process_kline(symbol, kline_json[0])
-                self.last_kline_fetch[symbol] = now
+                self._process_kline(symbol, kline_json[0], interval='1m')
+            
+            # Poll 1h kline (less frequent? For now poll same rate to keep it simple, or optimize later)
+            # Since 1h candle updates every minute anyway (current candle), we should poll it.
+            kline_1h_json = self._fetch_with_fallback(
+                primary=lambda: self._get_json(
+                    f"{self.base_primary}/fapi/v1/klines",
+                    params={"symbol": symbol, "interval": "1h", "limit": 1},
+                ),
+                fallback=lambda: self._get_json(
+                    f"{self.base_fallback}/api/v3/klines",
+                    params={"symbol": symbol, "interval": "1h", "limit": 1},
+                ),
+                context=f"kline:{symbol}:1h",
+            )
+            if kline_1h_json and isinstance(kline_1h_json, list) and kline_1h_json:
+                self._process_kline(symbol, kline_1h_json[0], interval='1h')
+
+            self.last_kline_fetch[symbol] = now
 
     # ---------------- HTTP Helpers ---------------- #
 
@@ -314,7 +330,7 @@ class PublicPriceIngestor:
         except Exception as e:
             self.logger.error(f"Trade process error {symbol}: {e}")
 
-    def _process_kline(self, symbol: str, kline_arr: List[Any]) -> None:
+    def _process_kline(self, symbol: str, kline_arr: List[Any], interval: str = '1m') -> None:
         try:
             # Kline array format (spot/futures): [
             # 0 openTime, 1 open, 2 high, 3 low, 4 close, 5 volume,
@@ -322,6 +338,7 @@ class PublicPriceIngestor:
             # ]
             kline = {
                 "symbol": symbol,
+                "interval": interval,
                 "timestamp": int(kline_arr[6]) if len(kline_arr) > 6 else get_timestamp(),
                 "open": float(kline_arr[1]),
                 "high": float(kline_arr[2]),
@@ -331,10 +348,17 @@ class PublicPriceIngestor:
                 "trades": int(kline_arr[8]) if len(kline_arr) > 8 else 0,
             }
             if symbol not in self.kline_data:
-                self.kline_data[symbol] = []
-            self.kline_data[symbol].append(kline)
-            if len(self.kline_data[symbol]) > 200:
-                self.kline_data[symbol] = self.kline_data[symbol][-200:]
+                self.kline_data[symbol] = {}
+            
+            if isinstance(self.kline_data[symbol], list):
+                 self.kline_data[symbol] = {'1m': self.kline_data[symbol]}
+
+            if interval not in self.kline_data[symbol]:
+                self.kline_data[symbol][interval] = []
+
+            self.kline_data[symbol][interval].append(kline)
+            if len(self.kline_data[symbol][interval]) > 200:
+                self.kline_data[symbol][interval] = self.kline_data[symbol][interval][-200:]
             self._store_kline(kline)
         except Exception as e:
             self.logger.error(f"Kline process error {symbol}: {e}")
@@ -375,12 +399,13 @@ class PublicPriceIngestor:
         self.redis_manager.publish("trade_updates", data)
 
     def _store_kline(self, kline: Dict[str, Any]) -> None:
-        key = f"kline:{kline['symbol']}"
+        interval = kline.get('interval', '1m')
+        key = f"kline:{kline['symbol']}:{interval}"
         self.redis_manager.set_data(key, kline, expiry=300)
-        list_key = f"klines:{kline['symbol']}"
+        list_key = f"klines:{kline['symbol']}:{interval}"
         self.redis_manager.redis_client.lpush(list_key, json.dumps(kline))
         self.redis_manager.redis_client.ltrim(list_key, 0, 199)
-        self.redis_manager.redis_client.expire(list_key, 3600)
+        self.redis_manager.redis_client.expire(list_key, 3600 * 24)
 
     # ---------------- Accessors ---------------- #
 
@@ -390,8 +415,12 @@ class PublicPriceIngestor:
     def get_latest_trade(self, symbol: str) -> Optional[TradeData]:
         return self.latest_trades.get(symbol)
 
-    def get_kline_history(self, symbol: str, count: int = 100) -> List[Dict[str, Any]]:
-        klines = self.kline_data.get(symbol, [])
+    def get_kline_history(self, symbol: str, count: int = 100, interval: str = '1m') -> List[Dict[str, Any]]:
+        symbol_data = self.kline_data.get(symbol, {})
+        if isinstance(symbol_data, list):
+             klines = symbol_data if interval == '1m' else []
+        else:
+             klines = symbol_data.get(interval, [])
         return klines[-count:] if len(klines) > count else klines
 
     # ---------------- Health ---------------- #

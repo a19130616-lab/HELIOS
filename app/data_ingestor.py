@@ -80,6 +80,26 @@ class DataIngestor:
         """Start the data ingestion process."""
         self.logger.info("Starting Data Ingestor...")
         self.is_running = True
+
+        # Backfill historical klines needed by downstream components.
+        # The SignalEngine hybrid strategy requires ~50 closed 1h candles to compute EMA(50).
+        # Without backfill, a cold start can produce *zero* signals/decisions for many hours.
+        # PublicPriceIngestor already performs historical backfill in public mode; this is for live WS mode.
+        try:
+            self._backfill_required_klines()
+        except Exception as e:
+            # Non-fatal: do not block ingestion if backfill fails.
+            self.logger.warning(f"Kline backfill skipped/failed: {e}")
+
+        # Historical backfill to prevent long warm-up periods for strategies that
+        # require higher-timeframe indicators (e.g., 1h EMA).
+        # Without this, the system may run for many hours with 0 decisions after a cold start.
+        try:
+            if not self.synthetic_mode:
+                self._backfill_historical_klines()
+        except Exception as e:
+            # Non-fatal: keep the system running even if backfill fails (rate limits, network, etc.)
+            self.logger.warning(f"Historical kline backfill skipped/failed: {e}")
         
         # Start price logging thread for both demo and live modes
         self.price_logging_thread = threading.Thread(target=self._run_price_logging, daemon=True)
@@ -95,6 +115,143 @@ class DataIngestor:
             self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
             self.ws_thread.start()
             self.logger.info(f"Data Ingestor started for symbols: {self.symbols}")
+
+    def _backfill_required_klines(self) -> None:
+        """Backfill historical klines into Redis to avoid long warm-up periods.
+
+        Currently backfills 1h klines so EMA(50) can be computed immediately.
+        Uses authenticated REST client when available.
+        """
+        if self.synthetic_mode:
+            return
+        if self.api_client is None:
+            # Public mode uses PublicPriceIngestor for backfill.
+            return
+
+        # Fetch enough candles for EMA(50) plus buffer.
+        interval = "1h"
+        limit = 120
+
+        now_ms = get_timestamp()
+        total_loaded = 0
+
+        for symbol in self.symbols:
+            try:
+                list_key = f"klines:{symbol}:{interval}"
+                try:
+                    existing = int(self.redis_manager.redis_client.llen(list_key) or 0)
+                except Exception:
+                    existing = 0
+
+                # If we already have enough history, skip.
+                if existing >= 60:
+                    continue
+
+                self.logger.info(f"[HIST] Backfilling {interval} klines for {symbol} (need EMA warmup)...")
+                klines = self.api_client.klines(symbol=symbol, interval=interval, limit=limit)
+                if not klines or not isinstance(klines, list):
+                    continue
+
+                loaded_for_symbol = 0
+                for k in klines:
+                    try:
+                        # Expected format: [open_time, open, high, low, close, volume, close_time, ...]
+                        if not isinstance(k, (list, tuple)) or len(k) < 7:
+                            continue
+
+                        close_time = int(k[6])
+                        # Skip candles that are not closed yet (avoid partial 1h candle).
+                        if close_time > now_ms:
+                            continue
+
+                        kline = {
+                            "symbol": symbol,
+                            "interval": interval,
+                            "timestamp": close_time,
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5]),
+                            "trades": int(k[8]) if len(k) > 8 and str(k[8]).isdigit() else 0,
+                        }
+
+                        # Store in Redis list+key schema used elsewhere.
+                        self._store_kline(kline)
+                        loaded_for_symbol += 1
+                    except Exception:
+                        continue
+
+                if loaded_for_symbol:
+                    total_loaded += loaded_for_symbol
+                    self.logger.info(f"[HIST] Backfilled {loaded_for_symbol} {interval} klines for {symbol}")
+            except Exception as e:
+                self.logger.warning(f"[HIST] Backfill failed for {symbol} {interval}: {e}")
+
+        if total_loaded:
+            self.logger.info(f"[HIST] Kline backfill complete interval={interval} total_loaded={total_loaded}")
+
+    def _backfill_historical_klines(self, interval: str = "1h", limit: int = 120) -> None:
+        """Backfill historical klines into Redis.
+
+        This is intentionally small and focused: it only fills Redis with enough
+        higher-timeframe candles so SignalEngine can compute trend indicators
+        immediately after startup.
+
+        Args:
+            interval: Kline interval string (e.g., '1h')
+            limit: Number of candles to fetch per symbol
+        """
+        if not self.api_client:
+            self.logger.info("Skipping historical kline backfill (no authenticated api_client)")
+            return
+
+        started = time.time()
+        total = 0
+        self.logger.info(
+            f"[HIST] Backfilling {interval} klines (limit={limit}) for {len(self.symbols)} symbols to warm indicators..."
+        )
+
+        for symbol in self.symbols:
+            try:
+                klines = self.api_client.klines(symbol=symbol, interval=interval, limit=limit)
+                if not klines or not isinstance(klines, list):
+                    self.logger.warning(f"[HIST] No klines returned for {symbol} {interval}")
+                    continue
+
+                # Binance returns oldest->newest. We store via LPUSH so the newest ends up at the head.
+                loaded = 0
+                for idx, k in enumerate(klines):
+                    try:
+                        # kline format: [openTime, open, high, low, close, volume, closeTime, quoteVol, trades, ...]
+                        close_time = int(k[6]) if len(k) > 6 else int(k[0])
+                        kline = {
+                            "symbol": symbol,
+                            "interval": interval,
+                            "timestamp": close_time,
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5]),
+                            "trades": int(k[8]) if len(k) > 8 else 0,
+                        }
+                        self._store_kline(kline)
+                        loaded += 1
+                    except Exception as inner_e:
+                        self.logger.debug(f"[HIST] Parse/store error {symbol} {interval} idx={idx}: {inner_e}")
+
+                total += loaded
+                self.logger.info(f"[HIST] Loaded {loaded}/{len(klines)} {interval} klines for {symbol}")
+
+                # Gentle pacing to reduce risk of rate limiting
+                time.sleep(0.2)
+            except Exception as e:
+                self.logger.warning(f"[HIST] Failed to backfill klines for {symbol} {interval}: {e}")
+
+        self.logger.info(
+            f"[HIST] Kline backfill complete interval={interval} total_klines={total} duration={time.time() - started:.2f}s"
+        )
 
     def _normalize_ws_message(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
         """Normalize websocket callback payloads across connector versions.
@@ -327,6 +484,22 @@ class DataIngestor:
             callback=self._make_ws_callback(symbol, self._handle_kline_update)
         )
         self.stream_ids.append(kline_stream_id)
+
+        # 1-hour kline stream (for trend filter)
+        kline_1h_stream_id = self.ws_client.kline(
+            symbol=symbol_lower,
+            interval="1h",
+            callback=self._make_ws_callback(symbol, self._handle_kline_update)
+        )
+        self.stream_ids.append(kline_1h_stream_id)
+
+        # 1-hour kline stream (for trend filter)
+        kline_1h_stream_id = self.ws_client.kline(
+            symbol=symbol_lower,
+            interval="1h",
+            callback=self._make_ws_callback(symbol, self._handle_kline_update)
+        )
+        self.stream_ids.append(kline_1h_stream_id)
         
         self.logger.info(f"Subscribed to streams for {symbol}")
     
@@ -420,8 +593,10 @@ class DataIngestor:
                 return
             
             # Parse kline data
+            interval = kline_data.get('i', '1m')
             kline = {
                 'symbol': symbol,
+                'interval': interval,
                 'timestamp': kline_data.get('T', get_timestamp()),
                 'open': float(kline_data.get('o', 0)),
                 'high': float(kline_data.get('h', 0)),
@@ -433,13 +608,20 @@ class DataIngestor:
             
             # Store kline data
             if symbol not in self.kline_data:
-                self.kline_data[symbol] = []
+                self.kline_data[symbol] = {}
             
-            self.kline_data[symbol].append(kline)
+            # Handle migration from list to dict if necessary
+            if isinstance(self.kline_data[symbol], list):
+                 self.kline_data[symbol] = {'1m': self.kline_data[symbol]}
+
+            if interval not in self.kline_data[symbol]:
+                self.kline_data[symbol][interval] = []
             
-            # Keep only last 200 klines per symbol
-            if len(self.kline_data[symbol]) > 200:
-                self.kline_data[symbol] = self.kline_data[symbol][-200:]
+            self.kline_data[symbol][interval].append(kline)
+            
+            # Keep only last 200 klines per symbol/interval
+            if len(self.kline_data[symbol][interval]) > 200:
+                self.kline_data[symbol][interval] = self.kline_data[symbol][interval][-200:]
             
             self._store_kline(kline)
             
@@ -503,16 +685,17 @@ class DataIngestor:
         Args:
             kline: Kline data
         """
-        key = f"kline:{kline['symbol']}"
+        interval = kline.get('interval', '1m')
+        key = f"kline:{kline['symbol']}:{interval}"
         
         # Store with 300 second expiry
         self.redis_manager.set_data(key, kline, expiry=300)
         
         # Also store in list for historical data
-        list_key = f"klines:{kline['symbol']}"
+        list_key = f"klines:{kline['symbol']}:{interval}"
         self.redis_manager.redis_client.lpush(list_key, json.dumps(kline))
         self.redis_manager.redis_client.ltrim(list_key, 0, 199)  # Keep last 200
-        self.redis_manager.redis_client.expire(list_key, 3600)  # 1 hour expiry
+        self.redis_manager.redis_client.expire(list_key, 3600 * 24)  # 24 hour expiry
     
     def _handle_reconnection(self) -> None:
         """Handle WebSocket reconnection with exponential backoff."""
@@ -551,18 +734,25 @@ class DataIngestor:
         """
         return self.latest_trades.get(symbol)
     
-    def get_kline_history(self, symbol: str, count: int = 100) -> List[Dict[str, Any]]:
+    def get_kline_history(self, symbol: str, count: int = 100, interval: str = '1m') -> List[Dict[str, Any]]:
         """
         Get kline history for a symbol.
         
         Args:
             symbol: Trading symbol
             count: Number of klines to retrieve
+            interval: Kline interval (default '1m')
             
         Returns:
             List of kline data
         """
-        klines = self.kline_data.get(symbol, [])
+        symbol_data = self.kline_data.get(symbol, {})
+        if isinstance(symbol_data, list):
+             # Fallback for old structure
+             klines = symbol_data if interval == '1m' else []
+        else:
+             klines = symbol_data.get(interval, [])
+             
         return klines[-count:] if len(klines) > count else klines
     
     def add_symbol(self, symbol: str) -> None:

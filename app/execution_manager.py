@@ -92,11 +92,17 @@ class ExecutionManager:
         except Exception:
             self.stop_loss_replace_after_sec = 8
             
+        # Maker order timeout in milliseconds (0.8s)
+        try:
+            self.maker_timeout_ms = int(self.config.get('trading', 'maker_timeout_ms', fallback=800))
+        except Exception:
+            self.maker_timeout_ms = 800
+
         # Trading cooldown
         try:
-            self.trading_cooldown_ms = self.config.get('trading', 'trading_cooldown_minutes', int, fallback=0) * 60 * 1000
+            self.trading_cooldown_ms = float(self.config.get('trading', 'trading_cooldown_minutes', fallback=0.5)) * 60 * 1000
         except Exception:
-            self.trading_cooldown_ms = 0
+            self.trading_cooldown_ms = 30000
 
         # Optional: flip (close-then-open) when an opposite signal arrives while a position is open.
         try:
@@ -740,7 +746,8 @@ class ExecutionManager:
                 for order_id in list(self.active_orders.keys()):
                     self._check_order_status(order_id)
                 
-                time.sleep(2)  # Check every 2 seconds
+                # Reduced sleep time for faster reaction (0.1s instead of 2s)
+                time.sleep(0.1)
                 
             except Exception as e:
                 self.logger.error(f"Error monitoring orders: {e}")
@@ -773,10 +780,80 @@ class ExecutionManager:
                 # Continue monitoring
                 pass
             else:
-                # Check if order is too old (cancel after 60 seconds)
+                # Check if order is too old (Maker Timeout)
                 order_age = get_timestamp() - order_info['timestamp']
-                if order_age > 60000:  # 60 seconds
+                
+                # Use configured maker_timeout_ms (default 800ms)
+                timeout_ms = getattr(self, 'maker_timeout_ms', 800)
+                
+                if order_age > timeout_ms:
+                    self.logger.info(f"Order {order_id} timed out after {order_age}ms. Cancelling to take liquidity.")
+                    
+                    # Cancel the maker order
                     self._cancel_order(order_id)
+                    
+                    # Immediately place a Taker order (Market or Aggressive Limit)
+                    # We want to "take liquidity" which means crossing the spread.
+                    # We'll use a MARKET order for guaranteed execution as per "take liquidity" instruction.
+                    # Alternatively, we could use an aggressive LIMIT.
+                    # Given "Aggressive Entry", MARKET is most reliable.
+                    
+                    # Retrieve original order details
+                    side = order_info['order']['side']
+                    quantity = float(order_info['position_size'])
+                    
+                    # Check if partially filled (remaining quantity)
+                    executed_qty = float(order.get('executedQty', 0))
+                    remaining_qty = quantity - executed_qty
+                    
+                    if remaining_qty > 0:
+                        formatted_qty = self._format_quantity(symbol, remaining_qty)
+                        if formatted_qty > 0:
+                            self.logger.info(f"Placing Taker (Aggressive Limit) order for remaining {formatted_qty} {symbol}")
+                            
+                            # Calculate aggressive price to ensure fill (crossing the spread)
+                            # This is effectively a Taker order but uses LIMIT type for slippage protection.
+                            try:
+                                ticker = self.api_client.ticker_price(symbol=symbol)
+                                current_price = float(ticker['price'])
+                                slippage = float(self.stop_loss_limit_slippage_pct)
+                                
+                                if side == "BUY":
+                                    limit_price = current_price * (1 + slippage)
+                                else:
+                                    limit_price = current_price * (1 - slippage)
+
+                                taker_params = {
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "type": "LIMIT",
+                                    "timeInForce": "IOC",
+                                    "quantity": formatted_qty,
+                                    "price": self._format_price(symbol, limit_price)
+                                }
+                                
+                                if self._is_hedge_mode():
+                                    position_side = self._resolve_position_side(order_info['signal'])
+                                    if position_side:
+                                        taker_params["positionSide"] = position_side
+                                else:
+                                    # For entry orders, reduceOnly is False (default)
+                                    pass
+                                    
+                                taker_order = self.api_client.new_order(**taker_params)
+                                
+                                # Track the new taker order
+                                if taker_order:
+                                    self.active_orders[taker_order['orderId']] = {
+                                        'order': taker_order,
+                                        'signal': order_info['signal'],
+                                        'timestamp': get_timestamp(),
+                                        'position_size': formatted_qty,
+                                        'order_side': order_info['order_side']
+                                    }
+                                    self.logger.info(f"Placed Taker order: {taker_order['orderId']}")
+                            except Exception as e:
+                                self.logger.error(f"Failed to place Taker order for {symbol}: {e}")
                     
         except Exception as e:
             self.logger.error(f"Error checking order status {order_id}: {e}")
